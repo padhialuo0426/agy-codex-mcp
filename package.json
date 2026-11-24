@@ -1,0 +1,27 @@
+{
+  "name": "agy-codex-mcp",
+  "version": "0.1.0",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "build": "tsc && node ui/build.mjs",
+    "start": "node dist/server.js",
+    "test": "pnpm build && node --test test/bridge.test.mjs",
+    "test:live": "pnpm build && node --test test/live.test.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/server": "2.4.0",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/client": "2.4.0",
+    "@types/node": "24.13.1",
+    "typescript": "5.9.3",
+    "@modelcontextprotocol/ext-apps": "2.0.4",
+    "esbuild": "0.28.1"
+  }
+}

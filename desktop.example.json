@@ -1,0 +1,21 @@
+{
+  "codex": "/usr/bin/codex",
+  "git": "/usr/bin/git",
+  "state_dir": "/path/to/state/agy-codex-mcp",
+  "workspace_roots": [
+    "/path/to/projects"
+  ],
+  "approval_dialog": "/usr/bin/zenity",
+  "approval_mode": "panel_or_dialog",
+  "approval_policy": "on-request",
+  "approval_timeout_seconds": 300,
+  "reuse_worktree_approval": true,
+  "allow_readonly_command_approval": true,
+  "writable_roots": [],
+  "extra_writable_roots": [],
+  "allowed_models": [],
+  "max_parallel": 3,
+  "max_depth": 1,
+  "max_turn_seconds": 600,
+  "question_timeout_seconds": 180
+}
