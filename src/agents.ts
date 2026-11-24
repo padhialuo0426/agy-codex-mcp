@@ -1,9 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
-import { codexApproval, type Decision } from "./approvals.js";
 import { Codex, message, output, record } from "./codex.js";
-import { State, busy, ownerAlive, ownerId, type Agent, type ApprovalChoice, type ApprovalNotice, type ApprovalOption, type Role } from "./state.js";
-import { approvalsEnabled, canWrite, ToolError, workspace, type Settings } from "./settings.js";
+import { State, busy, ownerAlive, ownerId, type Agent, type AgentMode, type Role } from "./state.js";
+import { ToolError, workspace, type Settings } from "./settings.js";
 import { makeWorktree, planWorktree, readChanges } from "./worktrees.js";
 
 const roles: Record<Role, string> = {
@@ -21,36 +20,44 @@ const mailboxTools = [
 const inputs = (text: string) => [{ type: "text", text, text_elements: [] }];
 type Id = string | number;
 type PendingQuestion = { id: string; rpc: Id; timer: NodeJS.Timeout };
-type PendingApproval = {
-  agent: string;
-  group: string;
-  rpc?: Id;
-  cancel: AbortController;
-  options: ApprovalOption[];
-  resolve: (choice: ApprovalChoice) => void;
+type RunArgs = {
+  agent_id?: string;
+  workspace?: string;
+  task: string;
+  context?: string;
+  mode: AgentMode;
+  role: Role;
+  network?: boolean;
+  model?: string;
+  effort?: string;
+  base?: string;
+  input_patch?: string;
+  fork_from?: string;
+  background: boolean;
+  timeout_seconds: number;
 };
-type DeadlineEntry = { timer?: NodeJS.Timeout; remainingMs: number; startedAt?: number };
-type Spawn = {
-  group_id?: string; workspace: string; task: string; context?: string;
-  role: Role; mode: "read_only" | "worktree"; network?: boolean; model?: string; effort?: string;
-  base?: string; input_patch?: string; fork_from?: string; request_id?: string;
+type WaitArgs = {
+  agent_ids: string[];
+  mode: "any" | "all";
+  seconds: number;
+  after?: number;
 };
-type Followup = { group_id: string; agent_id: string; task: string; context?: string };
-type Send = { group_id: string; agent_id: string; text: string; reply_to?: string; delivery: "steer" | "queue" };
+type SendArgs = {
+  agent_id: string;
+  text: string;
+  mode: "auto" | "steer" | "followup";
+  wait: boolean;
+  timeout_seconds: number;
+};
+type ManageArgs = {
+  action: "list" | "changes" | "interrupt" | "close";
+  agent_id?: string;
+  path?: string;
+  limit?: number;
+};
 
 function itemText(label: string, text: string) {
   return `${label}:\n${text}`;
-}
-
-function isApprovedDecision(decision: Decision): decision is "once" | "session" | "amend" {
-  return decision === "once" || decision === "session" || decision === "amend";
-}
-
-function waitAbort<T>(signal: AbortSignal, value: T): Promise<T> {
-  if (signal.aborted) return Promise.resolve(value);
-  return new Promise((resolve) => {
-    signal.addEventListener("abort", () => resolve(value), { once: true });
-  });
 }
 
 export class Agents {
@@ -58,15 +65,15 @@ export class Agents {
   private readonly codex: Codex;
   private readonly byThread = new Map<string, string>();
   private readonly questions = new Map<string, PendingQuestion>();
-  private readonly approvals = new Map<string, PendingApproval>();
-  private readonly approvalItems = new Map<string, Map<string, Record<string, unknown>>>();
   private readonly interrupting = new Set<string>();
-  private readonly deadlines = new Map<string, DeadlineEntry>();
+  private readonly deadlines = new Map<string, NodeJS.Timeout>();
   private readonly changing = new Set<string>();
+  private lastWaitSeq: number;
   private stopping = false;
 
   constructor(private readonly settings: Settings) {
     this.state = new State(settings.state_dir);
+    this.lastWaitSeq = this.state.latestSeq();
     this.codex = new Codex(settings);
     this.codex.on("notification", (method, params) => this.notify(method, params));
     this.codex.on("request", (id, method, params) => {
@@ -82,118 +89,164 @@ export class Agents {
     this.codex.stop();
   }
 
-  latestGroupId() {
-    return this.state.recentGroups(1)[0]?.group_id;
-  }
-
-  panelState(groupId?: string, after = 0) {
-    const recent_groups = this.state.recentGroups(12);
-    const target = groupId ?? recent_groups[0]?.group_id;
-    if (!target) {
-      return { group_id: null, recent_groups: [], cursor: 0, events: [], agents: [] };
-    }
-    const agents = this.state.group(target);
-    if (!agents.length) throw new ToolError("group_not_found", "Use a group ID returned by codex_spawn.");
-    const events = this.state.recent(target, [], after, 50);
-    return {
-      group_id: target,
-      recent_groups,
-      cursor: events.at(-1)?.seq ?? after,
-      events,
-      agents: agents.map((agent) => this.view(agent)),
-    };
-  }
-
-  decideApproval(group: string, agentId: string, approvalId: string, decision: ApprovalChoice) {
-    const agent = this.state.require(group, agentId);
-    if (agent.owner !== ownerId || !ownerAlive(agent.owner)) {
-      throw new ToolError("agent_detached", "This agent is not owned by the active desktop connection.");
-    }
-    const pending = this.approvals.get(approvalId);
-    if (!pending || pending.agent !== agentId || pending.group !== group) {
-      throw new ToolError("approval_not_pending", "This approval request is no longer pending.");
-    }
-    if (!pending.options.some((option) => option.choice === decision)) {
-      throw new ToolError("invalid_approval_decision", `Allowed decisions: ${pending.options.map((o) => o.choice).join(", ")}.`);
-    }
-    pending.resolve(decision);
-    return this.view(this.state.require(group, agentId));
-  }
-
-  async spawn(args: Spawn, parent?: Agent) {
+  async run(args: RunArgs, signal?: AbortSignal) {
     if (this.stopping) throw new ToolError("server_stopping", "The MCP server is shutting down.");
-    const writable = args.mode === "worktree";
-    const approvalsAllowed = approvalsEnabled(this.settings);
-    const cwd = workspace(this.settings, args.workspace, writable && !approvalsAllowed);
-    if ((args.base || args.input_patch) && !writable) throw new ToolError("worktree_required", "A base commit or input patch requires worktree mode.");
-    const wantsNetwork = Boolean(args.network);
-    const needsNetworkApproval = wantsNetwork && !this.settings.sandbox_network;
-    if (needsNetworkApproval && !approvalsAllowed) {
-      throw new ToolError("network_not_enabled", "Network access requires approval or sandbox_network in the desktop server configuration.");
+    const agent = args.agent_id
+      ? await this.continueAgent(args.agent_id, args.task, args.context)
+      : await this.spawnNew(args);
+    if (args.background) return agent;
+    return this.waitUntilSettled(agent.agent_id, args.timeout_seconds, signal);
+  }
+
+  async wait(args: WaitArgs, signal: AbortSignal) {
+    const startCursor = args.after ?? this.lastWaitSeq;
+    let initial = args.agent_ids.length
+      ? args.agent_ids.map((id) => this.state.require(id))
+      : this.state.activeOwned();
+    if (!initial.length) {
+      const events = this.state.recentForAgents([], startCursor, 30);
+      if (events.length) {
+        const cursor = events.at(-1)!.seq;
+        this.lastWaitSeq = Math.max(this.lastWaitSeq, cursor);
+        const ids = [...new Set(events.map((event) => event.agent_id))];
+        return {
+          reason: "all_finished",
+          cursor,
+          events,
+          agents: ids.map((id) => this.view(this.state.require(id))),
+        };
+      }
+      return { reason: "idle", cursor: startCursor, events: [], agents: [] };
     }
-    const plan = writable ? await planWorktree(this.settings, cwd, args.base) : undefined;
-    const requiresWorktreeApproval = Boolean(plan && (!canWrite(this.settings, cwd) || !canWrite(this.settings, plan.repository)));
-    if (requiresWorktreeApproval && plan && !approvalsAllowed) workspace(this.settings, plan.repository, true);
+    const targets = initial.map((agent) => ({ id: agent.id, generation: agent.generation }));
+    const targetIds = targets.map((target) => target.id);
+    const deadline = Date.now() + args.seconds * 1_000;
+    while (true) {
+      const agents = targets.map((target) => this.state.require(target.id));
+      const events = this.state.recentForAgents(targetIds, startCursor, 30);
+      const done = agents.every((agent, index) => agent.settled >= targets[index].generation || !ownerAlive(agent.owner));
+      const needsInput = agents.some((agent) => agent.question && ownerAlive(agent.owner));
+      const timedOut = Date.now() >= deadline;
+      if (done || needsInput || timedOut || (args.mode === "any" && events.length)) {
+        const cursor = events.at(-1)?.seq ?? startCursor;
+        this.lastWaitSeq = Math.max(this.lastWaitSeq, cursor);
+        return {
+          reason: needsInput ? "needs_input" : done ? "all_finished" : (args.mode === "any" && events.length) ? "event" : "timeout",
+          cursor,
+          events,
+          agents: agents.map((agent) => this.view(agent)),
+        };
+      }
+      await delay(Math.min(200, Math.max(1, deadline - Date.now())), undefined, { signal });
+    }
+  }
+
+  async send(args: SendArgs, signal?: AbortSignal) {
+    const outcome = await this.exclusive(args.agent_id, async () => {
+      const agent = this.state.require(args.agent_id);
+      if (args.mode === "auto" && agent.question) {
+        const ownedAgent = this.owned(agent.id);
+        const pending = this.questions.get(ownedAgent.id);
+        if (!pending) throw new ToolError("question_not_pending", "This question is no longer pending.");
+        this.answer(ownedAgent, args.text, true);
+        this.state.event(ownedAgent, "answered", output(args.text, 1_000), pending.id);
+        return { delivery: "answer" as const, waitable: true, view: this.view(ownedAgent) };
+      }
+      if (args.mode === "steer" || (args.mode === "auto" && agent.status === "running" && agent.turn)) {
+        const ownedAgent = this.owned(agent.id);
+        if (ownedAgent.status === "running" && ownedAgent.turn) {
+          await this.codex.request("turn/steer", {
+            threadId: ownedAgent.thread, expectedTurnId: ownedAgent.turn, input: inputs(args.text),
+          });
+          this.state.event(ownedAgent, "steered", output(args.text, 1_000));
+          return { delivery: "steer" as const, waitable: false, view: this.view(this.state.require(ownedAgent.id)) };
+        }
+        this.enqueue(ownedAgent, args.text);
+        return { delivery: "queued" as const, waitable: false, view: this.view(ownedAgent) };
+      }
+      if (busy(agent)) {
+        throw new ToolError("agent_busy", "This agent is currently running. Use mode='steer' or wait for it to settle.");
+      }
+      await this.resumeIfNeeded(agent.id);
+      const started = await this.startFollowupUnlocked(agent.id, args.text);
+      return { delivery: "followup" as const, waitable: true, view: started };
+    });
+
+    if (args.wait && outcome.waitable) {
+      return this.waitUntilSettled(args.agent_id, args.timeout_seconds, signal);
+    }
+    return { delivery: outcome.delivery, ...outcome.view };
+  }
+
+  async manage(args: ManageArgs) {
+    if (args.action === "list") {
+      return { agents: this.state.listRecent(args.limit ?? 20).map((agent) => this.view(agent)) };
+    }
+    const agentId = args.agent_id;
+    if (!agentId) {
+      throw new ToolError("agent_required", `Action '${args.action}' requires agent_id.`);
+    }
+    if (args.action === "changes") {
+      return readChanges(this.settings, this.state.require(agentId), args.path);
+    }
+    if (args.action === "interrupt") {
+      return this.exclusive(agentId, async () => this.stopTurn(this.owned(agentId)));
+    }
+    return this.close(agentId);
+  }
+
+  async models(cursor?: string, limit = 30) {
+    const allow = this.settings.allowed_models;
+    const result = await this.codex.request("model/list", { cursor, limit, includeHidden: false });
+    const rows = Array.isArray(result.data) ? result.data.map(record) : [];
+    const models = rows.flatMap((row) => {
+      const model = message(row.model) ?? message(row.id);
+      const id = message(row.id) ?? model;
+      if (!model || !id || row.hidden === true || (allow.length && !allow.includes(model) && !allow.includes(id))) return [];
+      const efforts = Array.isArray(row.supportedReasoningEfforts) ? row.supportedReasoningEfforts.map(record) : [];
+      return [{
+        model, id, name: message(row.displayName) ?? model,
+        default: row.isDefault === true, default_effort: message(row.defaultReasoningEffort),
+        efforts: efforts.map((effort) => message(effort.reasoningEffort)).filter((effort): effort is string => Boolean(effort)),
+      }];
+    });
+    return { models, cursor: message(result.nextCursor) ?? null };
+  }
+
+  private async spawnNew(args: {
+    workspace?: string; task: string; context?: string; mode: AgentMode; role: Role;
+    network?: boolean; model?: string; effort?: string; base?: string; input_patch?: string; fork_from?: string;
+  }, parent?: Agent) {
+    if (!args.workspace) {
+      throw new ToolError("workspace_required", "Provide workspace when starting a new agent, or pass agent_id to continue an existing one.");
+    }
+    const cwd = workspace(this.settings, args.workspace);
+    if ((args.base || args.input_patch) && args.mode !== "worktree") {
+      throw new ToolError("worktree_required", "A base commit or input patch requires worktree mode.");
+    }
+    const plan = args.mode === "worktree" ? await planWorktree(this.settings, cwd, args.base) : undefined;
     const selectedModel = await this.selectModel(cwd, args.model, args.effort);
-    const group = args.group_id ?? randomUUID();
-    const id = args.request_id ?? randomUUID();
+    const id = randomUUID();
     const agent: Agent = {
-      id, group, role: args.role, task: args.task, workspace: cwd, cwd,
+      id, group: "default", role: args.role, mode: args.mode, task: args.task, workspace: cwd, cwd,
       status: "starting", owner: ownerId, generation: 1, settled: 0, queue: [],
       parent: parent?.id, depth: parent ? parent.depth + 1 : 1, model: selectedModel, effort: args.effort,
-      network: wantsNetwork,
+      network: args.network,
     };
-    let existing: Agent | undefined;
     let source: Agent | undefined;
     this.state.change(() => {
-      existing = this.state.find(id);
-      if (existing) {
-        if ((args.group_id && args.group_id !== existing.group) || args.task !== existing.task || cwd !== existing.workspace) {
-          throw new ToolError("request_conflict", "Use a fresh request ID for a different task.");
-        }
-        return;
-      }
-      if (args.group_id && !this.state.group(group).length) throw new ToolError("group_not_found", "Use an existing group ID or omit it to create a group.");
       if (agent.depth > this.settings.max_depth) throw new ToolError("depth_limit", "Nested delegation has reached its configured depth limit.");
       if (args.fork_from) {
-        source = this.state.require(group, args.fork_from);
+        source = this.state.require(args.fork_from);
         if (!source.thread || busy(source) || source.workspace !== cwd) {
-          throw new ToolError("fork_unavailable", "Fork a settled Codex agent in the same project and group.");
+          throw new ToolError("fork_unavailable", "Fork a settled Codex agent in the same workspace.");
         }
       }
-      this.checkCapacity(group);
+      this.checkCapacity();
       this.state.save(agent);
       this.state.event(agent, "starting", output(args.task, 1_000));
     });
-    if (existing) return this.view(existing);
-    const needsUpfrontApproval = requiresWorktreeApproval || needsNetworkApproval;
-    const approvalKind = requiresWorktreeApproval ? "worktree" : "spawn_permissions";
-    const approvalSummary = requiresWorktreeApproval && needsNetworkApproval
-      ? "创建可写 Git worktree 并开启沙箱网络"
-      : requiresWorktreeApproval
-        ? "创建可写 Git worktree"
-        : "开启沙箱网络访问";
-    const approvalDetails = needsUpfrontApproval ? {
-      操作: approvalKind === "worktree" ? "为这次任务创建可写 Git worktree" : "为只读子代理开启网络访问",
-      ...(plan ? { 仓库: plan.repository, 基线提交: plan.base } : {}),
-      项目目录: cwd,
-      网络访问: wantsNetwork,
-      任务: args.task,
-      模型: selectedModel,
-      思考强度: args.effort,
-      补充上下文: args.context,
-      输入补丁: args.input_patch,
-    } : undefined;
-    const approvalOptions: ApprovalOption[] = [
-      { choice: "once", label: "批准一次" },
-      { choice: "session", label: requiresWorktreeApproval ? "本工作树免重复审批" : "本会话放行" },
-      { choice: "decline", label: "拒绝" },
-    ];
-    return this.launch(agent, async (current, decision) => {
-      if (requiresWorktreeApproval && (decision === "session" || (decision === "once" && this.settings.reuse_worktree_approval))) {
-        current.worktree_approved = true;
-        this.state.save(current);
-      }
+    return this.launch(agent, async (current) => {
       if (plan) {
         const tree = await makeWorktree(this.settings, current, plan, args.input_patch);
         if (!this.activeTurn(current)) return;
@@ -212,129 +265,105 @@ export class Agents {
       this.byThread.set(thread, current.id);
       this.state.save(current);
       await this.startTurn(current, args.task, args.context);
-    }, approvalDetails ? { kind: approvalKind, summary: approvalSummary, details: approvalDetails, options: approvalOptions } : undefined);
-  }
-
-  async followup(args: Followup) {
-    return this.exclusive(args.agent_id, async () => {
-      const agent = this.owned(args.group_id, args.agent_id);
-      const tree = agent.worktree;
-      const needsApproval = Boolean(
-        tree && !agent.worktree_approved && (!canWrite(this.settings, agent.workspace) || !canWrite(this.settings, tree.repository)),
-      );
-      if (needsApproval && !approvalsEnabled(this.settings)) {
-        workspace(this.settings, tree!.repository, true);
-      }
-      this.state.change(() => {
-        if (busy(agent)) throw new ToolError("agent_busy", "Use codex_send to steer an active agent, or interrupt it before starting another task.");
-        this.checkCapacity(agent.group);
-        agent.status = "starting";
-        agent.followup_task = args.task;
-        agent.generation++;
-        agent.turn = undefined;
-        agent.last = undefined;
-        this.state.save(agent);
-        this.state.event(agent, "starting", output(args.task, 1_000));
-      });
-      return this.launch(agent, async (current, decision) => {
-        if (needsApproval && (decision === "session" || (decision === "once" && this.settings.reuse_worktree_approval))) {
-          current.worktree_approved = true;
-          this.state.save(current);
-        }
-        await this.startTurn(current, args.task, args.context);
-      }, needsApproval && tree ? {
-        kind: "worktree",
-        summary: "在已有可写 Git worktree 运行续派任务",
-        details: {
-          操作: "在已有可写 Git worktree 运行一轮续派任务",
-          仓库: tree.repository,
-          工作树: tree.path,
-          基线提交: tree.base,
-          任务: args.task,
-          补充上下文: args.context,
-          模型: agent.model,
-          思考强度: agent.effort,
-        },
-        options: [
-          { choice: "once", label: "批准一次" },
-          { choice: "session", label: "本工作树免重复审批" },
-          { choice: "decline", label: "拒绝" },
-        ],
-      } : undefined);
     });
   }
 
-  async send(args: Send) {
-    return this.exclusive(args.agent_id, async () => {
-      const agent = this.owned(args.group_id, args.agent_id);
-      if (args.reply_to) {
-        const pending = this.questions.get(agent.id);
-        if (pending?.id !== args.reply_to) throw new ToolError("question_not_pending", "Read the agent's current question ID before replying.");
-        this.answer(agent, args.text, true);
-        this.state.event(agent, "answered", output(args.text, 1_000), pending.id);
-        return { delivery: "answer", ...this.view(agent) };
+  private async continueAgent(agentId: string, task: string, context?: string) {
+    return this.exclusive(agentId, async () => {
+      const current = this.state.require(agentId);
+      if (busy(current)) {
+        throw new ToolError("agent_busy", "This agent is currently busy. Use codex_send or codex_wait instead.");
       }
-      if (agent.question && args.delivery === "steer") {
-        throw new ToolError("reply_required", "This agent is waiting for an answer. Include its question ID as reply_to.");
-      }
-      if (agent.status === "running" && agent.turn && args.delivery === "steer") {
-        await this.codex.request("turn/steer", {
-          threadId: agent.thread, expectedTurnId: agent.turn, input: inputs(args.text),
-        });
-        this.state.event(agent, "steered", output(args.text, 1_000));
-        return { delivery: "steer", ...this.view(this.state.require(agent.group, agent.id)) };
-      }
-      this.enqueue(agent, args.text);
-      return { delivery: "queued", ...this.view(agent) };
+      await this.resumeIfNeeded(agentId);
+      return this.startFollowupUnlocked(agentId, task, context);
     });
   }
 
-  list(group: string) {
-    const agents = this.state.group(group);
-    if (!agents.length) throw new ToolError("group_not_found", "Use a group ID returned by codex_spawn.");
-    return { group_id: group, agents: agents.map((agent) => this.view(agent)) };
+  private async startFollowupUnlocked(agentId: string, task: string, context?: string) {
+    const agent = this.owned(agentId);
+    this.state.change(() => {
+      if (busy(agent)) throw new ToolError("agent_busy", "This agent is currently busy.");
+      this.checkCapacity();
+      agent.status = "starting";
+      agent.followup_task = task;
+      agent.generation++;
+      agent.turn = undefined;
+      agent.last = undefined;
+      this.state.save(agent);
+      this.state.event(agent, "starting", output(task, 1_000));
+    });
+    return this.launch(agent, (current) => this.startTurn(current, task, context));
   }
 
-  async wait(group: string, ids: string[], after: number, mode: "any" | "all_finished", seconds: number, signal: AbortSignal) {
-    const initial = ids.length ? ids.map((id) => this.state.require(group, id)) : this.state.group(group);
-    if (!initial.length) throw new ToolError("group_not_found", "Use a group ID returned by codex_spawn.");
-    const targets = initial.map((agent) => ({ id: agent.id, generation: agent.generation }));
-    const deadline = Date.now() + seconds * 1_000;
-    while (true) {
-      const agents = targets.map((target) => this.state.require(group, target.id));
-      const events = this.state.recent(group, ids, after, 20);
-      const done = agents.every((agent, index) => agent.settled >= targets[index].generation || !ownerAlive(agent.owner));
-      const needsInput = agents.some((agent) => agent.question && ownerAlive(agent.owner));
-      const needsApproval = agents.some((agent) => agent.approvals?.length && ownerAlive(agent.owner));
-      const newApproval = needsApproval && events.some((event) => event.kind === "approval_requested");
-      const timedOut = Date.now() >= deadline;
-      if (done || needsInput || newApproval || timedOut || (mode === "any" && events.length)) {
-        return {
-          group_id: group,
-          reason: newApproval ? "needs_approval" : needsInput ? "needs_input" : done ? "all_finished" : (mode === "any" && events.length) ? "event" : "timeout",
-          events, cursor: events.at(-1)?.seq ?? after, agents: agents.map((agent) => this.view(agent)),
-        };
+  private async resumeIfNeeded(id: string) {
+    let agent = this.state.require(id);
+    if (agent.owner === ownerId && agent.status !== "closed" && agent.thread && this.byThread.has(agent.thread)) {
+      return agent;
+    }
+    if (!agent.thread) throw new ToolError("no_saved_session", "This agent did not start a Codex session. Start a new agent.");
+    const savedThread = agent.thread;
+    workspace(this.settings, agent.workspace);
+    this.state.change(() => {
+      agent = this.state.require(id);
+      if (agent.owner && agent.owner !== ownerId && ownerAlive(agent.owner)) {
+        throw new ToolError("other_connection", "This agent is already attached to another live connection.");
       }
-      await delay(Math.min(200, Math.max(1, deadline - Date.now())), undefined, { signal });
+      agent.owner = ownerId;
+      agent.status = "idle";
+      agent.settled = agent.generation;
+      agent.question = undefined;
+      agent.turn = undefined;
+      this.state.save(agent);
+    });
+    try {
+      await this.codex.request("thread/resume", { threadId: savedThread, excludeTurns: true, ...await this.threadOptions(agent) });
+      this.byThread.set(savedThread, agent.id);
+      this.state.event(agent, "resumed", "Session reattached.");
+      return agent;
+    } catch (error) {
+      const current = this.state.require(id);
+      current.owner = undefined;
+      this.finish(current, "failed", this.describe(error));
+      throw error;
     }
   }
 
-  async interrupt(group: string, id: string) {
-    return this.exclusive(id, async () => {
-      const agent = this.state.require(group, id);
-      return this.stopTurn(agent.owner === ownerId && agent.approvals?.length ? agent : this.owned(group, id));
-    });
+  private async waitUntilSettled(agentId: string, timeoutSeconds: number, signal?: AbortSignal) {
+    const initial = this.state.require(agentId);
+    const targetGen = initial.generation;
+    const deadline = Date.now() + timeoutSeconds * 1_000;
+    while (true) {
+      const current = this.state.require(agentId);
+      const done = current.settled >= targetGen || !ownerAlive(current.owner);
+      const needsInput = Boolean(current.question && ownerAlive(current.owner));
+      const timedOut = Date.now() >= deadline;
+      if (done || needsInput || timedOut) {
+        const view = this.view(current);
+        let changes: Record<string, unknown> | undefined;
+        if (current.worktree && current.settled >= targetGen) {
+          try {
+            changes = await readChanges(this.settings, current);
+          } catch { /* Ignore diff read failure on settled summary. */ }
+        }
+        return {
+          ...view,
+          ...(timedOut && !done && !needsInput ? { timed_out: true } : {}),
+          ...(changes ? { changes } : {}),
+        };
+      }
+      await delay(Math.min(150, Math.max(1, deadline - Date.now())), undefined, { signal });
+    }
   }
 
-  async close(group: string, id: string) {
+  private async close(id: string) {
     return this.exclusive(id, async () => {
-      const agent = this.state.require(group, id);
+      const agent = this.state.require(id);
       if (agent.status === "closed") return this.view(agent);
       if (agent.owner && agent.owner !== ownerId && ownerAlive(agent.owner)) {
-        throw new ToolError("other_connection", "Close this agent from its originating desktop connection.");
+        throw new ToolError("other_connection", "Close this agent from its originating connection.");
       }
       if (agent.owner === ownerId && busy(agent)) await this.stopTurn(agent, true);
-      const current = this.state.require(group, id);
+      const current = this.state.require(id);
       if (current.owner === ownerId && current.thread) {
         await this.codex.request("thread/unsubscribe", { threadId: current.thread });
         this.byThread.delete(current.thread);
@@ -346,67 +375,9 @@ export class Agents {
       current.turn = undefined;
       current.question = undefined;
       this.state.save(current);
-      this.state.event(current, "closed", "Agent closed. Its saved session and workspace can be resumed.");
+      this.state.event(current, "closed", "Agent closed. Its saved session and workspace can be continued later.");
       return this.view(current);
     });
-  }
-
-  async resume(group: string, id: string) {
-    return this.exclusive(id, async () => {
-      let agent = this.state.require(group, id);
-      if (!agent.thread) throw new ToolError("no_saved_session", "This agent did not start a Codex session. Spawn a new agent.");
-      if (agent.owner === ownerId && this.byThread.has(agent.thread)) return this.view(agent);
-      const savedThread = agent.thread;
-      workspace(this.settings, agent.workspace, Boolean(agent.worktree) && !approvalsEnabled(this.settings));
-      this.state.change(() => {
-        agent = this.state.require(group, id);
-        if (agent.owner !== ownerId && ownerAlive(agent.owner)) {
-          throw new ToolError("other_connection", "This agent is already attached to another live desktop connection.");
-        }
-        agent.owner = ownerId;
-        agent.status = "idle";
-        agent.settled = agent.generation;
-        agent.question = undefined;
-        agent.approvals = undefined;
-        agent.turn = undefined;
-        this.state.save(agent);
-      });
-      try {
-        await this.codex.request("thread/resume", { threadId: savedThread, excludeTurns: true, ...await this.threadOptions(agent) });
-        this.byThread.set(savedThread, agent.id);
-        this.state.event(agent, "resumed", "Session restored. Use codex_followup to start another turn.");
-        return this.view(agent);
-      } catch (error) {
-        const current = this.state.require(group, id);
-        current.owner = undefined;
-        this.finish(current, "failed", this.describe(error));
-        throw error;
-      }
-    });
-  }
-
-  changes(group: string, id: string, path?: string) {
-    return readChanges(this.settings, this.state.require(group, id), path);
-  }
-
-  checkGroup(group: string) { this.list(group); }
-
-  async models(cursor?: string, limit = 30) {
-    const allow = this.settings.allowed_models;
-    const result = await this.codex.request("model/list", { cursor, limit, includeHidden: false });
-    const rows = Array.isArray(result.data) ? result.data.map(record) : [];
-    const models = rows.flatMap((row) => {
-      const model = message(row.model) ?? message(row.id);
-      const id = message(row.id) ?? model;
-      if (!model || !id || row.hidden === true || (allow.length && !allow.includes(model) && !allow.includes(id))) return [];
-      const efforts = Array.isArray(row.supportedReasoningEfforts) ? row.supportedReasoningEfforts.map(record) : [];
-      return [{
-        model, id, name: message(row.displayName) ?? model,
-        default: row.isDefault === true, default_effort: message(row.defaultReasoningEffort),
-        efforts: efforts.map((effort) => message(effort.reasoningEffort)).filter((effort): effort is string => Boolean(effort)),
-      }];
-    });
-    return { models, cursor: message(result.nextCursor) ?? null };
   }
 
   private async selectModel(cwd: string, requested?: string, effort?: string) {
@@ -429,69 +400,67 @@ export class Agents {
     return undefined;
   }
 
-  private checkCapacity(group: string) {
-    if (this.state.countActive(group) >= this.settings.max_parallel) {
+  private checkCapacity() {
+    if (this.state.countActive() >= this.settings.max_parallel) {
       throw new ToolError("concurrency_limit", "Wait for a task to finish or interrupt an agent before starting another.");
     }
   }
 
-  private owned(group: string, id: string) {
-    const agent = this.state.require(group, id);
+  private owned(id: string) {
+    const agent = this.state.require(id);
     if (agent.owner !== ownerId || agent.status === "closed" || !agent.thread || !this.byThread.has(agent.thread)) {
-      throw new ToolError("agent_detached", "Use codex_resume to attach this saved agent before sending work.");
+      throw new ToolError("agent_detached", "This agent is not attached to the active connection.");
     }
     return agent;
+  }
+
+  private agentMode(agent: Agent): AgentMode {
+    return agent.mode ?? (agent.worktree ? "worktree" : "read_only");
   }
 
   private view(agent: Agent) {
     const active = ownerAlive(agent.owner);
     return {
-      group_id: agent.group, agent_id: agent.id, role: agent.role, parent_id: agent.parent,
-      model: agent.model, effort: agent.effort,
-      status: !active && busy(agent) ? "interrupted" : active && agent.approvals?.length ? "needs_approval" : agent.status,
-      attached: active, generation: agent.generation, queued_messages: agent.queue.length,
-      task: output(agent.followup_task ?? agent.task, 500), question: active ? agent.question : undefined, result: agent.last,
-      approvals: active ? agent.approvals : undefined,
-      workspace: agent.workspace, worktree_path: agent.worktree?.path, base_commit: agent.worktree?.base,
-      network: Boolean(agent.network || this.settings.sandbox_network),
+      agent_id: agent.id,
+      role: agent.role,
+      mode: this.agentMode(agent),
+      parent_id: agent.parent,
+      model: agent.model,
+      effort: agent.effort,
+      status: !active && busy(agent) ? "interrupted" : agent.status,
+      attached: active,
+      generation: agent.generation,
+      queued_messages: agent.queue.length,
+      task: output(agent.followup_task ?? agent.task, 500),
+      question: active ? agent.question : undefined,
+      result: agent.last,
+      workspace: agent.workspace,
+      worktree_path: agent.worktree?.path,
+      base_commit: agent.worktree?.base,
+      network: Boolean(agent.network ?? this.settings.sandbox_network),
     };
   }
 
-  private approvalPolicy() {
-    if (!approvalsEnabled(this.settings)) return "never";
-    if (this.settings.approval_policy === "granular") {
-      return {
-        granular: {
-          sandbox_approval: true,
-          rules: true,
-          skill_approval: false,
-          request_permissions: true,
-          mcp_elicitations: false,
-        },
-      };
-    }
-    return this.settings.approval_policy;
-  }
-
   private sandboxPolicy(agent: Agent) {
-    const networkAccess = Boolean(agent.network || this.settings.sandbox_network);
-    if (agent.worktree) {
-      const writableRoots = [...new Set([
-        agent.worktree.path,
-        ...(agent.worktree.git_dir ? [agent.worktree.git_dir] : []),
-        ...this.settings.extra_writable_roots,
-      ])];
-      return {
-        type: "workspaceWrite" as const,
-        writableRoots,
-        networkAccess,
-        excludeTmpdirEnvVar: false,
-        excludeSlashTmp: false,
-      };
+    const mode = this.agentMode(agent);
+    const networkAccess = Boolean(agent.network ?? this.settings.sandbox_network);
+    if (mode === "read_only") {
+      return { type: "readOnly" as const, networkAccess };
     }
+    if (this.settings.sandbox_mode === "danger-full-access") {
+      return { type: "dangerFullAccess" as const };
+    }
+    const writableRoots = [...new Set([
+      agent.worktree?.path ?? agent.cwd,
+      ...(agent.worktree?.git_dir ? [agent.worktree.git_dir] : []),
+      ...this.settings.extra_writable_roots,
+    ])];
     return {
-      type: "readOnly" as const,
+      type: "workspaceWrite" as const,
+      writableRoots,
       networkAccess,
+      excludeTmpdirEnvVar: false,
+      excludeSlashTmp: false,
     };
   }
 
@@ -502,18 +471,29 @@ export class Agents {
     const disable = (value: unknown) => Object.fromEntries(
       Object.keys(record(value)).map((key) => [key, { enabled: false }]),
     );
+    const mode = this.agentMode(agent);
     const developerInstructions = [
       roles[agent.role],
       "You are a subagent delegated by Antigravity. Use report_to_parent for meaningful interim findings and ask_parent for a blocking clarification.",
       "The parent reviews your result. Report concrete evidence and tests run. Follow the workspace instructions.",
-      agent.worktree ? "Work in the assigned isolated Git worktree. Leave changes for the parent to review." : "This is a read-only task.",
+      mode === "worktree"
+        ? "Work in the assigned isolated Git worktree. Leave changes for the parent to review."
+        : mode === "workspace"
+          ? "Edit directly in the assigned workspace directory within your assigned scope."
+          : "This is a read-only task.",
     ].join("\n");
+    const sandbox = mode === "read_only"
+      ? "read-only"
+      : this.settings.sandbox_mode === "danger-full-access"
+        ? "danger-full-access"
+        : "workspace-write";
     return {
       cwd: agent.cwd,
-      approvalPolicy: this.approvalPolicy(),
-      ...(this.settings.approvals_reviewer ? { approvalsReviewer: this.settings.approvals_reviewer } : {}),
-      sandbox: agent.worktree ? "workspace-write" : "read-only",
-      model: agent.model, developerInstructions, ephemeral: false,
+      approvalPolicy: "never" as const,
+      sandbox,
+      model: agent.model,
+      developerInstructions,
+      ephemeral: false,
       config: { mcp_servers: disable(effective.mcp_servers), plugins: disable(effective.plugins) },
     };
   }
@@ -528,14 +508,14 @@ export class Agents {
     return [
       ...tools,
       {
-        name: "message_peer", description: "Send context to a known peer agent ID in this group.",
+        name: "message_peer", description: "Send context to a known peer agent ID.",
         inputSchema: {
           type: "object", properties: { agent_id: { type: "string" }, text: { type: "string", minLength: 1, maxLength: 6_000 } },
           required: ["agent_id", "text"], additionalProperties: false,
         },
       },
       ...(this.settings.max_depth > 1 ? [{
-        name: "delegate_child", description: "Start a read-only child agent in this group. The parent can inspect it and its result.",
+        name: "delegate_child", description: "Start a read-only child agent. The parent can inspect it and its result.",
         inputSchema: {
           type: "object", properties: { task: { type: "string", minLength: 1, maxLength: 6_000 } },
           required: ["task"], additionalProperties: false,
@@ -560,7 +540,7 @@ export class Agents {
       if (error instanceof ToolError && error.code === "codex_timeout") this.codex.stop();
       throw error;
     }
-    const current = this.state.require(agent.group, agent.id);
+    const current = this.state.require(agent.id);
     if (current.owner !== ownerId || current.generation !== agent.generation) return;
     const turn = message(record(result.turn).id);
     if (!turn) {
@@ -577,101 +557,17 @@ export class Agents {
     if (current?.owner === ownerId && current.generation === agent.generation && busy(current)) return current;
   }
 
-  private async launch(
-    agent: Agent,
-    start: (agent: Agent, decision?: Decision) => Promise<void>,
-    approval?: { kind: string; summary: string; details: Record<string, unknown>; options: ApprovalOption[] },
-  ) {
-    const run = async (decision?: Decision) => {
-      const current = this.activeTurn(agent);
-      if (!current) return this.view(this.state.require(agent.group, agent.id));
-      try {
-        await start(current, decision);
-        return this.view(this.state.require(agent.group, agent.id));
-      } catch (error) {
-        const failed = this.activeTurn(agent);
-        if (failed) {
-          this.finish(failed, "failed", this.describe(error));
-        }
-        throw error;
-      }
-    };
-    if (!approval) return run();
-    void this.askApproval(agent, approval.kind, approval.summary, approval.details, approval.options).then(async (decision) => {
-      const current = this.activeTurn(agent);
-      if (!current) return;
-      if (isApprovedDecision(decision)) await run(decision);
-      else this.finish(current, "interrupted", `${approval.kind} approval ${decision}. No turn started.`);
-    }).catch(() => {
-      const current = this.activeTurn(agent);
-      if (current) this.finish(current, "failed", "The upfront approval could not be processed.");
-    });
-    return this.view(this.state.require(agent.group, agent.id));
-  }
-
-  private async askApproval(
-    agent: Agent,
-    kind: string,
-    summary: string,
-    details: Record<string, unknown>,
-    options: ApprovalOption[],
-    rpc?: Id,
-  ): Promise<Decision> {
-    const seconds = this.settings.approval_timeout_seconds;
-    const notice: ApprovalNotice = {
-      id: randomUUID(),
-      kind,
-      summary,
-      details,
-      options,
-      expires_at: new Date(Date.now() + seconds * 1_000).toISOString(),
-    };
-    const cancel = new AbortController();
-    let resolvePanel!: (choice: ApprovalChoice) => void;
-    let settledPanel = false;
-    const panelPromise = new Promise<Decision>((resolve) => {
-      resolvePanel = (choice) => {
-        if (settledPanel) return;
-        settledPanel = true;
-        resolve(choice === "decline" ? "declined" : choice);
-      };
-    });
-
-    this.approvals.set(notice.id, {
-      agent: agent.id,
-      group: agent.group,
-      rpc,
-      cancel,
-      options,
-      resolve: resolvePanel,
-    });
-    this.pauseDeadline(agent.id);
-    const current = this.state.require(agent.group, agent.id);
-    current.approvals = [...(current.approvals ?? []), notice];
-    this.state.save(current);
-    this.state.event(current, "approval_requested", `${kind} · ${notice.id} · ${summary} · Waiting for a human decision in the Codex side panel.`);
-
-    let decision: Decision = "declined";
+  private async launch(agent: Agent, start: (agent: Agent) => Promise<void>) {
+    const current = this.activeTurn(agent);
+    if (!current) return this.view(this.state.require(agent.id));
     try {
-      const expires = AbortSignal.timeout(Math.max(1, seconds * 1_000));
-      decision = await Promise.race([
-        panelPromise,
-        waitAbort(cancel.signal, "cancelled" as const),
-        waitAbort(expires, "expired" as const),
-      ]);
-    } finally {
-      this.approvals.delete(notice.id);
-      const updated = this.activeTurn(agent);
-      if (updated) {
-        const remaining = updated.approvals?.filter((entry) => entry.id !== notice.id);
-        updated.approvals = remaining?.length ? remaining : undefined;
-        this.state.save(updated);
-        const eventKind = decision === "once" ? "approval_approved" : `approval_${decision}`;
-        this.state.event(updated, eventKind, `${kind} · ${notice.id}`);
-        if (!updated.approvals?.length) this.resumeDeadline(agent.id);
-      }
+      await start(current);
+      return this.view(this.state.require(agent.id));
+    } catch (error) {
+      const failed = this.activeTurn(agent);
+      if (failed) this.finish(failed, "failed", this.describe(error));
+      throw error;
     }
-    return decision;
   }
 
   private markStarted(agent: Agent, turn: string) {
@@ -680,61 +576,35 @@ export class Agents {
     this.state.save(agent);
     this.state.event(agent, "running", "Codex started the turn.");
     this.clearDeadline(agent.id);
-    this.startDeadline(agent.id, this.settings.max_turn_seconds * 1_000);
-  }
-
-  private startDeadline(id: string, remainingMs: number) {
-    if (remainingMs <= 0) return;
     const timer = setTimeout(() => {
-      const current = this.state.find(id);
-      if (!current || !busy(current)) return;
+      const current = this.state.find(agent.id);
+      if (!current || current.generation !== agent.generation || !busy(current)) return;
       this.state.event(current, "time_limit", "The configured turn deadline elapsed.");
       void this.stopTurn(current).catch(() => this.codex.stop());
-    }, remainingMs);
-    this.deadlines.set(id, { timer, remainingMs, startedAt: Date.now() });
-  }
-
-  private pauseDeadline(id: string) {
-    const entry = this.deadlines.get(id);
-    if (!entry?.timer) return;
-    clearTimeout(entry.timer);
-    entry.timer = undefined;
-    const elapsed = entry.startedAt ? Date.now() - entry.startedAt : 0;
-    entry.remainingMs = Math.max(1_000, entry.remainingMs - elapsed);
-    entry.startedAt = undefined;
-  }
-
-  private resumeDeadline(id: string) {
-    const entry = this.deadlines.get(id);
-    if (!entry || entry.timer) return;
-    this.startDeadline(id, entry.remainingMs);
+    }, this.settings.max_turn_seconds * 1_000);
+    this.deadlines.set(agent.id, timer);
   }
 
   private async stopTurn(agent: Agent, waitForDone = false) {
     if (!busy(agent)) return this.view(agent);
-    if (!agent.turn) {
-      if (!agent.approvals?.length) throw new ToolError("agent_starting", "The turn is still being started. Retry after the running event.");
-      this.finish(agent, "interrupted", "Upfront approval cancelled before the turn started.");
-      return this.view(agent);
-    }
+    if (!agent.turn) throw new ToolError("agent_starting", "The turn is still being started. Retry after the running event.");
     this.interrupting.add(agent.id);
-    this.cancelApprovals(agent.id);
     try {
       await this.codex.request("turn/interrupt", { threadId: agent.thread, turnId: agent.turn });
     } catch (error) {
       this.interrupting.delete(agent.id);
-      const current = this.state.require(agent.group, agent.id);
+      const current = this.state.require(agent.id);
       if (!busy(current)) return this.view(current);
       throw error;
     }
     if (waitForDone) {
       const deadline = Date.now() + 5_000;
-      while (busy(this.state.require(agent.group, agent.id))) {
+      while (busy(this.state.require(agent.id))) {
         if (Date.now() >= deadline) throw new ToolError("interrupt_pending", "Codex acknowledged the interrupt. Wait for its terminal event before closing.");
         await delay(100);
       }
     }
-    return this.view(this.state.require(agent.group, agent.id));
+    return this.view(this.state.require(agent.id));
   }
 
   private enqueue(agent: Agent, value: string) {
@@ -759,46 +629,21 @@ export class Agents {
     const agent = this.findThread(params.threadId);
     if (method !== "item/tool/call") {
       if (method === "item/tool/requestUserInput") {
-        this.codex.fail(id, "This desktop bridge handles parent questions through ask_parent.");
+        this.codex.fail(id, "Use ask_parent to ask the parent a question.");
         return;
       }
-      const item = agent ? this.approvalItems.get(agent.id)?.get(message(params.itemId) ?? "") : undefined;
-      const handler = codexApproval(method, params, item, Boolean(agent?.worktree), {
-        allowReadonlyCommandApproval: this.settings.allow_readonly_command_approval,
-        fallbackCwd: agent?.cwd ?? this.settings.state_dir,
-      });
-      if (!handler) {
-        if (agent) this.state.event(agent, "unhandled_request", `Unhandled Codex server request: ${method}`);
-        this.codex.fail(id, `Unsupported Codex server request: ${method}`);
+      if (method === "item/permissions/requestApproval") {
+        if (agent) this.state.event(agent, "approval_auto_declined", `${method} · approval_policy_never`);
+        this.codex.reply(id, { permissions: {}, scope: "turn" });
         return;
       }
-      if (!agent || !agent.turn || agent.turn !== params.turnId || !busy(agent) || this.interrupting.has(agent.id)) {
-        this.codex.reply(id, handler.respond("decline"));
+      if (method === "item/commandExecution/requestApproval" || method === "item/fileChange/requestApproval") {
+        if (agent) this.state.event(agent, "approval_auto_declined", `${method} · approval_policy_never`);
+        this.codex.reply(id, { decision: "decline" });
         return;
       }
-      if (!handler.offer || !approvalsEnabled(this.settings)) {
-        const reason = handler.declineReason ?? "approvals_disabled";
-        this.state.event(agent, "approval_auto_declined", `${method} · ${reason}`);
-        this.codex.reply(id, handler.respond("decline"));
-        return;
-      }
-      const decision = await this.askApproval(
-        agent,
-        handler.offer.kind,
-        handler.offer.summary,
-        handler.offer.details,
-        handler.offer.options,
-        id,
-      );
-      const current = this.activeTurn(agent);
-      if (current?.turn === agent.turn && !this.stopping) {
-        this.codex.reply(
-          id,
-          isApprovedDecision(decision) && !this.interrupting.has(agent.id)
-            ? handler.respond(decision)
-            : handler.respond("decline"),
-        );
-      }
+      if (agent) this.state.event(agent, "unhandled_request", `Unhandled Codex server request: ${method}`);
+      this.codex.fail(id, `Unsupported Codex server request: ${method}`);
       return;
     }
     const args = record(params.arguments);
@@ -829,18 +674,21 @@ export class Agents {
       this.state.event(agent, "question", text, questionId);
     } else if (tool === "message_peer") {
       try {
-        const peer = this.owned(agent.group, message(args.agent_id) ?? "");
+        const peer = this.owned(message(args.agent_id) ?? "");
         if (peer.id === agent.id) throw new ToolError("same_agent", "Select a different agent.");
         const result = await this.send({
-          group_id: agent.group, agent_id: peer.id, text: `From peer ${agent.id}: ${text}`,
-          delivery: peer.question ? "queue" : "steer",
+          agent_id: peer.id,
+          text: `From peer ${agent.id}: ${text}`,
+          mode: peer.question ? "steer" : "auto",
+          wait: false,
+          timeout_seconds: 120,
         });
-        reply(`Message ${result.delivery === "queued" ? "queued" : "delivered"} for ${peer.id}.`);
+        reply(`Message ${"delivery" in result && result.delivery === "queued" ? "queued" : "delivered"} for ${peer.id}.`);
       } catch (error) { reply(this.describe(error), false); }
     } else if (tool === "delegate_child") {
       try {
-        const child = await this.spawn({
-          group_id: agent.group, task: text, workspace: agent.workspace, role: "explorer", mode: "read_only",
+        const child = await this.spawnNew({
+          task: text, workspace: agent.workspace, role: "explorer", mode: "read_only",
         }, agent);
         reply(`Started child ${child.agent_id}. Its final result will be sent to your mailbox.`);
       } catch (error) { reply(this.describe(error), false); }
@@ -859,17 +707,8 @@ export class Agents {
       return;
     }
     if (agent.turn && (params.turnId ?? turn.id) && (params.turnId ?? turn.id) !== agent.turn) return;
-    if (method === "item/started") {
+    if (method === "item/completed") {
       const item = record(params.item);
-      const id = message(item.id);
-      if (id && (item.type === "fileChange" || item.type === "commandExecution")) {
-        const items = this.approvalItems.get(agent.id) ?? new Map<string, Record<string, unknown>>();
-        items.set(id, item);
-        this.approvalItems.set(agent.id, items);
-      }
-    } else if (method === "item/completed") {
-      const item = record(params.item);
-      this.approvalItems.get(agent.id)?.delete(message(item.id) ?? "");
       const text = message(item.text);
       if (item.type === "agentMessage" && text) {
         if (item.phase === "commentary") this.state.event(agent, "commentary", output(text, 2_000));
@@ -886,16 +725,15 @@ export class Agents {
         const parent = this.state.find(agent.parent);
         if (parent?.owner === ownerId && parent.thread && parent.status !== "closed") {
           void this.send({
-            group_id: agent.group, agent_id: parent.id,
+            agent_id: parent.id,
             text: `Child ${agent.id} ${status}: ${output(description, 3_000)}`,
-            delivery: parent.question ? "queue" : "steer",
+            mode: "steer",
+            wait: false,
+            timeout_seconds: 120,
           }).catch(() => undefined);
         }
       }
     } else if (method === "serverRequest/resolved") {
-      for (const pending of this.approvals.values()) {
-        if (pending.agent === agent.id && pending.rpc === params.requestId) pending.cancel.abort();
-      }
       const question = this.questions.get(agent.id);
       if (question && question.rpc === params.requestId) {
         clearTimeout(question.timer);
@@ -913,15 +751,12 @@ export class Agents {
   }
 
   private finish(agent: Agent, status: "completed" | "failed" | "interrupted", text: string) {
-    this.cancelApprovals(agent.id);
-    this.approvalItems.delete(agent.id);
     this.interrupting.delete(agent.id);
     const question = this.questions.get(agent.id);
     if (question) clearTimeout(question.timer);
     this.questions.delete(agent.id);
     this.clearDeadline(agent.id);
     agent.question = undefined;
-    agent.approvals = undefined;
     agent.turn = undefined;
     agent.last = text;
     agent.status = status;
@@ -931,24 +766,18 @@ export class Agents {
     this.state.event(agent, status, text);
   }
 
-  private cancelApprovals(agent: string) {
-    for (const pending of this.approvals.values()) {
-      if (pending.agent === agent) pending.cancel.abort();
-    }
-  }
-
   private recoverOwned() {
     for (const agent of this.state.owned()) {
       agent.owner = undefined;
-      if (busy(agent)) this.finish(agent, "interrupted", "The Codex connection closed. Resume the saved session before starting another turn.");
+      if (busy(agent)) this.finish(agent, "interrupted", "The Codex connection closed. Continue the saved agent to start another turn.");
       else this.state.save(agent);
     }
     this.byThread.clear();
   }
 
   private clearDeadline(id: string) {
-    const entry = this.deadlines.get(id);
-    if (entry?.timer) clearTimeout(entry.timer);
+    const timer = this.deadlines.get(id);
+    if (timer) clearTimeout(timer);
     this.deadlines.delete(id);
   }
 

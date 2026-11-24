@@ -13,18 +13,12 @@ const SettingsSchema = z.strictObject({
   codex: z.string().default("/usr/bin/codex"),
   git: z.string().default("/usr/bin/git"),
   state_dir: z.string(),
-  workspace_roots: z.array(z.string()).min(1),
-  writable_roots: z.array(z.string()).default([]),
+  workspace_roots: z.array(z.string()).default([]),
+  sandbox_mode: z.enum(["workspace-write", "danger-full-access"]).default("workspace-write"),
+  sandbox_network: z.boolean().default(true),
   extra_writable_roots: z.array(z.string()).default([]),
-  sandbox_network: z.boolean().default(false),
-  approval_mode: z.enum(["off", "panel"]).default("panel"),
-  approval_policy: z.enum(["on-request", "granular", "untrusted"]).default("on-request"),
-  approvals_reviewer: z.enum(["user", "auto_review", "guardian_subagent"]).optional(),
-  approval_timeout_seconds: z.number().int().min(5).max(600).default(120),
-  allow_readonly_command_approval: z.boolean().default(true),
-  reuse_worktree_approval: z.boolean().default(false),
   allowed_models: z.array(z.string()).default([]),
-  max_parallel: z.number().int().min(1).max(8).default(3),
+  max_parallel: z.number().int().min(1).max(8).default(4),
   max_turn_seconds: z.number().int().min(10).max(3600).default(600),
   question_timeout_seconds: z.number().int().min(10).max(1800).default(180),
   max_depth: z.number().int().min(1).max(3).default(1),
@@ -38,39 +32,23 @@ export function within(root: string, path: string) {
   return difference === "" || (!isAbsolute(difference) && difference !== ".." && !difference.startsWith("../"));
 }
 
-export function canWrite(settings: Settings, path: string) {
-  return settings.writable_roots.some((root) => within(root, path));
-}
-
-export type ApprovalMode = "off" | "panel";
-
-export function approvalsEnabled(settings: Settings): boolean {
-  return settings.approval_mode !== "off";
-}
-
 export function loadSettings(): Settings {
   const { values } = parseArgs({ options: { config: { type: "string" } } });
   if (!values.config) throw new Error("Launch with --config /absolute/path/to/desktop.json.");
   const config = SettingsSchema.parse(JSON.parse(readFileSync(values.config, "utf8")));
-  for (const path of [config.codex, config.git, config.state_dir, ...config.workspace_roots, ...config.writable_roots, ...config.extra_writable_roots]) {
-    if (!isAbsolute(path)) throw new Error("Use absolute paths in the desktop server configuration.");
+  for (const path of [config.codex, config.git, config.state_dir, ...config.workspace_roots, ...config.extra_writable_roots]) {
+    if (!isAbsolute(path)) throw new Error("Use absolute paths in the server configuration.");
   }
   mkdirSync(config.state_dir, { recursive: true, mode: 0o700 });
   config.state_dir = realpathSync(config.state_dir);
   config.workspace_roots = config.workspace_roots.map((path) => realpathSync(path));
-  config.writable_roots = config.writable_roots.map((path) => realpathSync(path));
   config.extra_writable_roots = config.extra_writable_roots.map((path) => {
     try { return realpathSync(path); } catch { return resolve(path); }
   });
-  for (const root of config.writable_roots) {
-    if (!config.workspace_roots.some((allowed) => within(allowed, root))) {
-      throw new Error("A writable root must be inside a configured workspace root.");
-    }
-  }
   return config;
 }
 
-export function workspace(settings: Settings, path: string, write: boolean) {
+export function workspace(settings: Settings, path: string) {
   if (!isAbsolute(path)) throw new ToolError("invalid_workspace", "Provide the absolute path of the active project.");
   let actual: string;
   try {
@@ -79,11 +57,8 @@ export function workspace(settings: Settings, path: string, write: boolean) {
   } catch {
     throw new ToolError("invalid_workspace", "The workspace path must exist and be a directory.");
   }
-  if (!settings.workspace_roots.some((root) => within(root, actual))) {
+  if (settings.workspace_roots.length > 0 && !settings.workspace_roots.some((root) => within(root, actual))) {
     throw new ToolError("workspace_out_of_scope", "The workspace is outside this server's configured project roots.");
-  }
-  if (write && !canWrite(settings, actual)) {
-    throw new ToolError("write_not_enabled", "This project has no writable worktree permission in the desktop server configuration.");
   }
   return actual;
 }

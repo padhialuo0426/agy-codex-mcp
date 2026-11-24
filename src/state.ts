@@ -4,27 +4,13 @@ import { DatabaseSync } from "node:sqlite";
 import { ToolError } from "./settings.js";
 
 export type AgentStatus = "starting" | "running" | "needs_input" | "idle" | "completed" | "failed" | "interrupted" | "closed";
+export type AgentMode = "read_only" | "worktree" | "workspace";
 export type Role = "default" | "explorer" | "reviewer" | "worker";
-export type ApprovalChoice = "once" | "session" | "amend" | "decline";
-export type ApprovalOption = { choice: ApprovalChoice; label: string };
-export type ApprovalNotice = {
-  id: string;
-  kind: string;
-  summary: string;
-  details: Record<string, unknown>;
-  options: ApprovalOption[];
-  expires_at: string;
-};
-export type RecentGroup = {
-  group_id: string;
-  pending_approvals: number;
-  active: number;
-  last_at?: string;
-};
 export type Agent = {
   id: string;
   group: string;
   role: Role;
+  mode?: AgentMode;
   task: string;
   followup_task?: string;
   workspace: string;
@@ -38,9 +24,7 @@ export type Agent = {
   queue: string[];
   last?: string;
   question?: { id: string; text: string };
-  approvals?: ApprovalNotice[];
   worktree?: { repository: string; path: string; base: string; git_dir?: string };
-  worktree_approved?: boolean;
   network?: boolean;
   parent?: string;
   depth: number;
@@ -95,14 +79,37 @@ export class State {
     return row ? JSON.parse(row.data) as Agent : undefined;
   }
 
-  group(group: string) {
-    return (this.db.prepare("SELECT data FROM agents WHERE agent_group = ? ORDER BY rowid").all(group) as Row[])
-      .map((row) => JSON.parse(row.data) as Agent);
+  require(id: string) {
+    const agent = this.find(id);
+    if (!agent) throw new ToolError("agent_not_found", "Use a valid agent ID.");
+    return agent;
   }
 
   owned() {
     return (this.db.prepare("SELECT data FROM agents WHERE json_extract(data, '$.owner') = ?").all(ownerId) as Row[])
       .map((row) => JSON.parse(row.data) as Agent);
+  }
+
+  activeOwned() {
+    return this.owned().filter((agent) => busy(agent));
+  }
+
+  countActive() {
+    return (this.db.prepare("SELECT data FROM agents WHERE json_extract(data, '$.owner') IS NOT NULL").all() as Row[])
+      .map((row) => JSON.parse(row.data) as Agent)
+      .filter((agent) => busy(agent) && ownerAlive(agent.owner)).length;
+  }
+
+  listRecent(limit = 20): Agent[] {
+    const all = (this.db.prepare("SELECT data FROM agents ORDER BY rowid DESC").all() as Row[])
+      .map((row) => JSON.parse(row.data) as Agent);
+    const active: Agent[] = [];
+    const settled: Agent[] = [];
+    for (const agent of all) {
+      if (ownerAlive(agent.owner) && busy(agent)) active.push(agent);
+      else settled.push(agent);
+    }
+    return [...active, ...settled].slice(0, limit);
   }
 
   change(action: () => void) {
@@ -126,53 +133,20 @@ export class State {
       .run(agent.group, agent.id, agent.generation, kind, text, questionId ?? null, new Date().toISOString());
   }
 
-  recent(group: string, ids: string[], after: number, limit: number) {
+  latestSeq(): number {
+    const row = this.db.prepare("SELECT COALESCE(MAX(seq), 0) AS seq FROM events").get() as { seq: number };
+    return row.seq;
+  }
+
+  recentForAgents(ids: string[], after: number, limit: number) {
     const filter = ids.length ? ` AND agent_id IN (${ids.map(() => "?").join(",")})` : "";
     const rows = this.db.prepare(`SELECT seq,agent_id,generation,kind,text,question_id,at
-      FROM events WHERE agent_group = ? AND seq > ?${filter} ORDER BY seq LIMIT ?`)
-      .all(group, after, ...ids, limit) as unknown as AgentEvent[];
+      FROM events WHERE seq > ?${filter} ORDER BY seq LIMIT ?`)
+      .all(after, ...ids, limit) as unknown as AgentEvent[];
     let chars = 0;
     return rows.filter((row) => {
       chars += row.text.length + 300;
       return chars <= 20_000;
     });
-  }
-
-  countActive(group: string) {
-    return this.group(group).filter((agent) => busy(agent) && ownerAlive(agent.owner)).length;
-  }
-
-  require(group: string, id: string) {
-    const agent = this.find(id);
-    if (!agent || agent.group !== group) throw new ToolError("agent_not_found", "Use an agent ID from this group.");
-    return agent;
-  }
-
-  recentGroups(limit = 10): RecentGroup[] {
-    const latest = new Map<string, { seq: number; at: string }>();
-    for (const row of this.db.prepare("SELECT agent_group, MAX(seq) AS seq, MAX(at) AS at FROM events GROUP BY agent_group").all() as Array<{ agent_group: string; seq: number; at: string }>) {
-      latest.set(row.agent_group, { seq: row.seq, at: row.at });
-    }
-    const groups = new Map<string, RecentGroup & { last_seq: number }>();
-    for (const row of this.db.prepare("SELECT data FROM agents").all() as Row[]) {
-      const agent = JSON.parse(row.data) as Agent;
-      const alive = ownerAlive(agent.owner);
-      const entry = groups.get(agent.group) ?? {
-        group_id: agent.group,
-        pending_approvals: 0,
-        active: 0,
-        last_seq: latest.get(agent.group)?.seq ?? 0,
-        last_at: latest.get(agent.group)?.at,
-      };
-      if (alive && agent.approvals?.length) entry.pending_approvals += agent.approvals.length;
-      if (alive && busy(agent)) entry.active++;
-      groups.set(agent.group, entry);
-    }
-    return [...groups.values()]
-      .sort((a, b) => Number(b.pending_approvals > 0) - Number(a.pending_approvals > 0)
-        || Number(b.active > 0) - Number(a.active > 0)
-        || b.last_seq - a.last_seq)
-      .slice(0, limit)
-      .map(({ group_id, pending_approvals, active, last_at }) => ({ group_id, pending_approvals, active, last_at }));
   }
 }

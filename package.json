@@ -8,7 +8,7 @@
     "node": ">=24"
   },
   "scripts": {
-    "build": "tsc && node ui/build.mjs",
+    "build": "tsc",
     "start": "node dist/server.js",
     "test": "pnpm build && node --test test/bridge.test.mjs",
     "test:live": "pnpm build && node --test test/live.test.mjs"
@@ -20,8 +20,6 @@
   "devDependencies": {
     "@modelcontextprotocol/client": "2.4.0",
     "@types/node": "24.13.1",
-    "typescript": "5.9.3",
-    "@modelcontextprotocol/ext-apps": "2.0.4",
-    "esbuild": "0.28.1"
+    "typescript": "5.9.3"
   }
 }

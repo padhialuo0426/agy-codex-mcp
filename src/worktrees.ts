@@ -25,18 +25,18 @@ export async function planWorktree(settings: Settings, cwd: string, baseRef?: st
   let base: string;
   try {
     repository = realpathSync((await git(settings, cwd, ["rev-parse", "--show-toplevel"])).trim());
-    workspace(settings, repository, false);
+    workspace(settings, repository);
     base = (await git(settings, repository, ["rev-parse", "--verify", "--end-of-options", `${baseRef ?? "HEAD"}^{commit}`])).trim();
   } catch (error) {
     if (error instanceof ToolError) throw error;
-    throw new ToolError("invalid_git_base", "Use a writable Git repository and an existing base commit.");
+    throw new ToolError("invalid_git_base", "Use a Git repository and an existing base commit.");
   }
   return { repository, base };
 }
 
 export async function makeWorktree(settings: Settings, agent: Agent, plan: Awaited<ReturnType<typeof planWorktree>>, patch?: string) {
   const { repository, base } = plan;
-  if (workspace(settings, repository, false) !== repository || workspace(settings, agent.workspace, false) !== agent.workspace) {
+  if (workspace(settings, repository) !== repository || workspace(settings, agent.workspace) !== agent.workspace) {
     throw new ToolError("workspace_changed", "The workspace moved after the worktree request was prepared.");
   }
   const parent = join(settings.state_dir, "worktrees");

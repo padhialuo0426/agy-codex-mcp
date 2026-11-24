@@ -70,8 +70,7 @@ export class Codex extends EventEmitter {
     const overrides = [
       "agents.enabled=false",
       'web_search="disabled"',
-      "allow_login_shell=false",
-      'shell_environment_policy.inherit="core"',
+      'shell_environment_policy.inherit="all"',
       ...this.settings.codex_config,
     ];
     const child = spawn(this.settings.codex, [

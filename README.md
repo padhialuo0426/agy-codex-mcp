@@ -1,45 +1,33 @@
-# Antigravity 的 Codex 子代理
+# Antigravity 的 Codex 子代理 (agy-codex-mcp)
 
-Antigravity 桌面 App 通过本地 stdio MCP 委派任务。桥接服务调用本机 `codex app-server`，沿用 Codex 登录。每个子代理有独立会话，Antigravity 主代理负责决定任务和验收结果。
+专为 Antigravity（`agy`）与 `/swarm` 打造的极简 Codex CLI MCP 桥接服务：无侧栏 GUI、无人工弹窗拦截，通过 5 个核心工具即可像原生子代理一样调用本地 Codex。
 
-## 安装与配置
+## 核心工具（仅 5 个）
 
-在项目目录运行 `pnpm install --frozen-lockfile` 和 `pnpm build`。需要 Linux、Node.js 24 以及已登录的 Codex CLI。先将 `desktop.example.json` 复制为 `desktop.json` 并填入本机路径。运行 `node scripts/cc-switch.mjs --open` 通过 CC Switch 导入 MCP，现有条目通过 CC Switch 的 MCP 页面编辑。导入只选择 Antigravity。脚本不加 `--open` 时输出待导入的服务器 JSON。
+1. **`codex_run`**：派工并等待完成（支持 `mode: "read_only" | "worktree" | "workspace"`）；传入 `agent_id` 可继续同一会话；传入 `background: true` 可立即返回并在后台并行运行。
+2. **`codex_wait`**：等待后台子代理，省略 `agent_ids` 与 `after` 时自动监听所有活跃子代理并从内部游标续读事件。
+3. **`codex_send`**：向子代理发消息（`mode: "auto"` 自动识别：若有待答问题则直接回复，无需 `reply_to`；运行中则转向 `turn/steer`；已结束则自动恢复并续派）。
+4. **`codex_manage`**：统一管理接口（`action: "list" | "changes" | "interrupt" | "close"`）。
+5. **`codex_models`**：查询当前 Codex 账号可用的模型 ID 与推理档位。
 
-`desktop.json` 控制 Codex 路径、项目范围、工作目录、并行度、沙箱和审批策略。当前运行状态在 `~/.local/state/agy-codex-mcp`。`workspace_roots` 允许派工，`writable_roots` 另外允许 Git worktree 模式。默认只读，工作树中的改动由主代理审核。修改启动配置后，重新连接该 MCP。
+## 沙箱与免审批策略
 
-常用沙箱与配置项：
+- 桥接对 Codex 线程固定传入 `approvalPolicy: "never"`，并默认继承完整环境变量（`shell_environment_policy.inherit="all"`）与开启联网（`sandbox_network: true`），消除构建工具找不到 PATH、缓存不可写或中途审批卡死的问题。
+- `workspace_roots` 默认为空 `[]`，允许任意已存在的绝对路径（便于直接接入 `/swarm` 的 `share` / `branch` 临时工作副本）。
+- `sandbox_mode` 控制可写任务（`worktree` / `workspace`）的沙箱级别：
+  - `"workspace-write"`：限制写入目标目录、worktree 的 `.git/worktrees/<id>` 以及 `extra_writable_roots`。
+  - `"danger-full-access"`：对可写任务完全放开文件系统与工具链限制（适合高度信任的本地环境）；`read_only` 任务仍保持只读沙箱。
 
-- `extra_writable_roots`：为 `worktree` 模式的 `sandboxPolicy.writableRoots` 额外追加可写目录（例如包管理器缓存目录）。此外，桥接层会自动将当前 worktree 路径及其隔离 Git 元数据目录（`.git/worktrees/<id>`）加入 `writableRoots`。
-- `sandbox_network`：默认 `false`；设为 `true` 时全局允许沙箱联网。按单次任务联网可在 `codex_spawn` 传入 `network: true`（未开启全局联网时会先触发人工审批）。
-- `codex_config`：追加到 `codex app-server -c` 参数列表末尾，可覆盖默认的 `shell_environment_policy` 等配置。
+## 配套 Skill（原生异步唤醒 + `/swarm` 接入）
 
-## 权限审批
+仓库内置 [skills/codex-subagent/SKILL.md](skills/codex-subagent/SKILL.md)，可复制到 `~/.gemini/config/skills/codex-subagent/SKILL.md`：
 
-桥接专为 Antigravity 打造，直接通过 **Antigravity 侧栏（MCP App `codex_panel`）** 进行人工审批，通过 `approval_mode` 配置：
+- **非阻塞后台代理**：由主代理用 `define_subagent(EnableMCPTools: true)` + `invoke_subagent(Model: "flash_lite")` 托管 `codex_run`，主对话直接获得系统级完成唤醒，免去手动轮询 `codex_wait`。
+- **`/swarm` 接入**：在 `/swarm` 会话中拉起轻量化代理成员（如 `workspace: "share"`），通过 `codex_run(workspace: <成员工作目录>, mode: "workspace")` 让 Codex 作为 Swarm 团队成员在独立副本中编码并向看板汇报。
 
-- `panel`（默认）：在 `codex_panel` 侧栏内展示待审批卡片，支持多个并发请求并列审批。
-- `off`：关闭人工审批通道（`approvalPolicy` 为 `"never"`）。
+## 安装与验证
 
-侧栏审批通过声明了 `_meta.ui.visibility = ["app"]` 的应用专属工具（`codex_panel_state` 与 `codex_approval_decide`）实现，**模型不可见且无法调用**，确保必须由用户在侧栏手动点击确认。
-
-相关审批行为选项：
-
-- `reuse_worktree_approval`：设为 `true` 时，在 `workspace_roots` 内的非白名单 Git 仓库一旦批准创建 worktree，同一代理后续 `codex_followup` 无需重复审批；也可在侧栏直接选择「本工作树免重复审批」。
-- `allow_readonly_command_approval`：默认 `true`，允许 `read_only` 子代理在需要人工确认命令执行时在侧栏请示，而不是直接静默拒绝。对于 `item/permissions/requestApproval` 会区分只读 `entries` 与写权限。所有策略拒绝和未知请求都会记录事件（`approval_auto_declined` / `unhandled_request`）。
-- `approval_policy`：支持 `"on-request"`（默认）、`"granular"` 或 `"untrusted"`；可选 `approvals_reviewer`（`"user"` / `"auto_review"` / `"guardian_subagent"`）。
-- 在运行期命令/权限审批中，侧栏支持「批准一次」、「本会话放行」（`acceptForSession` / `scope: "session"`）、「按规则放行」（`acceptWithExecpolicyAmendment` / `applyNetworkPolicyAmendment`）与「拒绝」。等待人工审批期间会暂停该轮 `max_turn_seconds` 倒计时。
-
-## 派工与对话
-
-1. 使用 `codex_models` 查询当前 Codex 账号的模型和各自支持的思考强度。派工时将查询返回的档位原样填入 `effort`。Codex 加入新档位后，服务会按模型列表接受该值。
-2. 使用 `codex_spawn` 派工，传入当前项目的绝对路径和任务。可选 `role`、`model`、`effort`、`mode`、`network` 和 `context`。省略模型或思考强度时由 Codex 取默认值。若配置了非空的 `allowed_models`，显式模型选择会限定在这些模型内。
-3. 把第一个调用返回的 `group_id` 用于同一批后续子代理。通过 `codex_wait` 增量读取进展，询问需要答复时，把问题 ID 放进 `codex_send.reply_to`。当返回 `needs_approval` 时可打开 `codex_panel` 让用户确认并继续等待。
-4. 用 `codex_followup` 在已有会话继续派工。`codex_interrupt` 中断当前一轮，`codex_close` 释放已加载会话，`codex_resume` 重新挂载。恢复后需要显式派工。
-5. 用 `codex_panel` 给桌面侧栏传入组 ID（省略时自动载入最近或存在待审批的代理组）。若宿主声明 MCP Apps 能力，侧栏提供状态、待审批卡片、最近代理组切换与直接控制按钮。
-
-可写任务使用独立 Git worktree。默认从当前 checkout 的 HEAD 创建，可显式指定 `base` 和 `input_patch`。用 `codex_changes` 查 diff 和未跟踪文件。关闭子代理会保留改动和会话，方便之后恢复。
-
-## 验证
-
-`pnpm test` 使用模拟 Codex App Server，覆盖 stdio 工具、消息、并发、中断、恢复、worktree、沙箱可写根目录以及侧栏审批流程。 `pnpm test:live` 用合成仓库直接调用已登录的 Codex，验证并行派工和同轮提问回复。该命令使用 Codex 用量，不启动 Antigravity 对话。
+1. 在项目目录运行 `pnpm install --frozen-lockfile && pnpm build`。
+2. 复制 `desktop.example.json` 为 `desktop.json` 并修改 `state_dir` 等本机路径。
+3. 运行 `node scripts/cc-switch.mjs --open` 导入 Antigravity MCP 配置，或将 `node dist/server.js --config /path/to/desktop.json` 写入 `mcp_config.json`。
+4. 本地验证：`pnpm test`（使用模拟 Codex App Server）。
