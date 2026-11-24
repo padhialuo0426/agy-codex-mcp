@@ -16,19 +16,17 @@ Antigravity 桌面 App 通过本地 stdio MCP 委派任务。桥接服务调用�
 
 ## 权限审批
 
-桥接支持 **Antigravity 侧栏审批（MCP App）** 与 **本机 Zenity 弹窗审批** 双通道，通过 `approval_mode` 配置：
+桥接专为 Antigravity 打造，直接通过 **Antigravity 侧栏（MCP App `codex_panel`）** 进行人工审批，通过 `approval_mode` 配置：
 
-- `panel_or_dialog`（默认当存在 `approval_dialog` 时）：若用户已打开 `codex_panel` 侧栏，则直接在侧栏审批，不再弹出抢焦点的 Zenity 窗口；否则同时支持侧栏与 Zenity 弹窗。如果 Zenity 启动失败或崩溃，会自动记录 `approval_dialog_unavailable` 事件并保留在侧栏等待确认，不会静默失败。
-- `panel`：仅使用 `codex_panel` 侧栏内嵌的人工审批卡片。
-- `dialog`：仅使用 `approval_dialog` 指定的本机弹窗程序。
+- `panel`（默认）：在 `codex_panel` 侧栏内展示待审批卡片，支持多个并发请求并列审批。
 - `off`：关闭人工审批通道（`approvalPolicy` 为 `"never"`）。
 
-侧栏审批通过声明了 `_meta.ui.visibility = ["app"]` 的应用专属工具（`codex_panel_state` 与 `codex_approval_decide`）实现，**模型不可见且无法调用**，确保必须由用户手动点击确认。
+侧栏审批通过声明了 `_meta.ui.visibility = ["app"]` 的应用专属工具（`codex_panel_state` 与 `codex_approval_decide`）实现，**模型不可见且无法调用**，确保必须由用户在侧栏手动点击确认。
 
 相关审批行为选项：
 
 - `reuse_worktree_approval`：设为 `true` 时，在 `workspace_roots` 内的非白名单 Git 仓库一旦批准创建 worktree，同一代理后续 `codex_followup` 无需重复审批；也可在侧栏直接选择「本工作树免重复审批」。
-- `allow_readonly_command_approval`：默认 `true`，允许 `read_only` 子代理在需要人工确认命令执行时弹窗/在侧栏请示，而不是直接静默拒绝。对于 `item/permissions/requestApproval` 会区分只读 `entries` 与写权限。所有策略拒绝和未知请求都会记录事件（`approval_auto_declined` / `unhandled_request`）。
+- `allow_readonly_command_approval`：默认 `true`，允许 `read_only` 子代理在需要人工确认命令执行时在侧栏请示，而不是直接静默拒绝。对于 `item/permissions/requestApproval` 会区分只读 `entries` 与写权限。所有策略拒绝和未知请求都会记录事件（`approval_auto_declined` / `unhandled_request`）。
 - `approval_policy`：支持 `"on-request"`（默认）、`"granular"` 或 `"untrusted"`；可选 `approvals_reviewer`（`"user"` / `"auto_review"` / `"guardian_subagent"`）。
 - 在运行期命令/权限审批中，侧栏支持「批准一次」、「本会话放行」（`acceptForSession` / `scope: "session"`）、「按规则放行」（`acceptWithExecpolicyAmendment` / `applyNetworkPolicyAmendment`）与「拒绝」。等待人工审批期间会暂停该轮 `max_turn_seconds` 倒计时。
 
@@ -44,4 +42,4 @@ Antigravity 桌面 App 通过本地 stdio MCP 委派任务。桥接服务调用�
 
 ## 验证
 
-`pnpm test` 使用模拟 Codex App Server，覆盖 stdio 工具、消息、并发、中断、恢复、worktree、沙箱可写根目录以及侧栏/弹窗双通道审批。 `pnpm test:live` 用合成仓库直接调用已登录的 Codex，验证并行派工和同轮提问回复。该命令使用 Codex 用量，不启动 Antigravity 对话。
+`pnpm test` 使用模拟 Codex App Server，覆盖 stdio 工具、消息、并发、中断、恢复、worktree、沙箱可写根目录以及侧栏审批流程。 `pnpm test:live` 用合成仓库直接调用已登录的 Codex，验证并行派工和同轮提问回复。该命令使用 Codex 用量，不启动 Antigravity 对话。

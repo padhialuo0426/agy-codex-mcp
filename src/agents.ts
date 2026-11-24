@@ -1,9 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
-import { ApprovalDialogs, codexApproval, type Decision } from "./approvals.js";
+import { codexApproval, type Decision } from "./approvals.js";
 import { Codex, message, output, record } from "./codex.js";
 import { State, busy, ownerAlive, ownerId, type Agent, type ApprovalChoice, type ApprovalNotice, type ApprovalOption, type Role } from "./state.js";
-import { approvalsEnabled, canWrite, effectiveApprovalMode, ToolError, workspace, type Settings } from "./settings.js";
+import { approvalsEnabled, canWrite, ToolError, workspace, type Settings } from "./settings.js";
 import { makeWorktree, planWorktree, readChanges } from "./worktrees.js";
 
 const roles: Record<Role, string> = {
@@ -56,7 +56,6 @@ function waitAbort<T>(signal: AbortSignal, value: T): Promise<T> {
 export class Agents {
   private readonly state: State;
   private readonly codex: Codex;
-  private readonly dialogs: ApprovalDialogs;
   private readonly byThread = new Map<string, string>();
   private readonly questions = new Map<string, PendingQuestion>();
   private readonly approvals = new Map<string, PendingApproval>();
@@ -64,13 +63,11 @@ export class Agents {
   private readonly interrupting = new Set<string>();
   private readonly deadlines = new Map<string, DeadlineEntry>();
   private readonly changing = new Set<string>();
-  private lastPanelPollAt = 0;
   private stopping = false;
 
   constructor(private readonly settings: Settings) {
     this.state = new State(settings.state_dir);
     this.codex = new Codex(settings);
-    this.dialogs = new ApprovalDialogs(settings.approval_dialog);
     this.codex.on("notification", (method, params) => this.notify(method, params));
     this.codex.on("request", (id, method, params) => {
       void this.serverRequest(id, method, params).catch(() => this.codex.fail(id, "The coordination request could not be processed."));
@@ -85,20 +82,11 @@ export class Agents {
     this.codex.stop();
   }
 
-  markPanelActive() {
-    this.lastPanelPollAt = Date.now();
-  }
-
-  private isPanelActive() {
-    return Date.now() - this.lastPanelPollAt < 10_000;
-  }
-
   latestGroupId() {
     return this.state.recentGroups(1)[0]?.group_id;
   }
 
   panelState(groupId?: string, after = 0) {
-    this.markPanelActive();
     const recent_groups = this.state.recentGroups(12);
     const target = groupId ?? recent_groups[0]?.group_id;
     if (!target) {
@@ -117,7 +105,6 @@ export class Agents {
   }
 
   decideApproval(group: string, agentId: string, approvalId: string, decision: ApprovalChoice) {
-    this.markPanelActive();
     const agent = this.state.require(group, agentId);
     if (agent.owner !== ownerId || !ownerAlive(agent.owner)) {
       throw new ToolError("agent_detached", "This agent is not owned by the active desktop connection.");
@@ -640,18 +627,12 @@ export class Agents {
       expires_at: new Date(Date.now() + seconds * 1_000).toISOString(),
     };
     const cancel = new AbortController();
-    const dialogCancel = new AbortController();
-    const abortDialog = () => dialogCancel.abort();
-    if (cancel.signal.aborted) dialogCancel.abort();
-    else cancel.signal.addEventListener("abort", abortDialog, { once: true });
-
     let resolvePanel!: (choice: ApprovalChoice) => void;
     let settledPanel = false;
     const panelPromise = new Promise<Decision>((resolve) => {
       resolvePanel = (choice) => {
         if (settledPanel) return;
         settledPanel = true;
-        dialogCancel.abort();
         resolve(choice === "decline" ? "declined" : choice);
       };
     });
@@ -668,71 +649,17 @@ export class Agents {
     const current = this.state.require(agent.group, agent.id);
     current.approvals = [...(current.approvals ?? []), notice];
     this.state.save(current);
-    const mode = effectiveApprovalMode(this.settings);
-    const waitHint = mode === "panel"
-      ? "Waiting for a human decision in the Codex side panel."
-      : mode === "dialog"
-        ? "Waiting for a human decision in the local desktop dialog."
-        : "Waiting for a human decision in the Codex side panel or local desktop dialog.";
-    this.state.event(current, "approval_requested", `${kind} · ${notice.id} · ${summary} · ${waitHint}`);
+    this.state.event(current, "approval_requested", `${kind} · ${notice.id} · ${summary} · Waiting for a human decision in the Codex side panel.`);
 
-    let decision: Decision = "unavailable";
-    const startedAt = Date.now();
-    const waitPanel = (ms: number) => {
-      const expires = AbortSignal.timeout(Math.max(1, ms));
-      return Promise.race([
+    let decision: Decision = "declined";
+    try {
+      const expires = AbortSignal.timeout(Math.max(1, seconds * 1_000));
+      decision = await Promise.race([
         panelPromise,
         waitAbort(cancel.signal, "cancelled" as const),
         waitAbort(expires, "expired" as const),
       ]);
-    };
-
-    try {
-      if (mode === "panel") {
-        decision = await waitPanel(seconds * 1_000);
-      } else if (mode === "dialog") {
-        const result = await this.dialogs.ask({
-          审批编号: notice.id, 审批类别: kind, 代理: agent.id, 项目: agent.workspace, 工作目录: agent.cwd, ...details,
-        }, seconds, dialogCancel.signal);
-        decision = result.decision;
-        if (result.decision === "unavailable" && result.detail) {
-          const updated = this.activeTurn(agent);
-          if (updated) this.state.event(updated, "approval_dialog_unavailable", `${kind} · ${notice.id} · ${result.detail}`);
-        }
-      } else if (mode === "panel_or_dialog") {
-        if (!this.settings.approval_dialog || this.isPanelActive()) {
-          decision = await waitPanel(seconds * 1_000);
-        } else {
-          const dialogPromise = this.dialogs.ask({
-            审批编号: notice.id, 审批类别: kind, 代理: agent.id, 项目: agent.workspace, 工作目录: agent.cwd, ...details,
-          }, seconds, dialogCancel.signal);
-          const raceResult = await Promise.race([
-            panelPromise.then((value) => ({ source: "panel" as const, decision: value })),
-            waitAbort(cancel.signal, { source: "cancel" as const, decision: "cancelled" as const }),
-            dialogPromise.then((outcome) => ({ source: "dialog" as const, outcome })),
-          ]);
-          if (raceResult.source === "panel" || raceResult.source === "cancel") {
-            dialogCancel.abort();
-            decision = raceResult.decision;
-          } else if (raceResult.outcome.decision !== "unavailable") {
-            decision = raceResult.outcome.decision;
-          } else {
-            const updated = this.activeTurn(agent);
-            if (updated) {
-              this.state.event(
-                updated,
-                "approval_dialog_unavailable",
-                `${kind} · ${notice.id} · ${raceResult.outcome.detail ?? "Approval dialog unavailable; waiting for side panel decision."}`,
-              );
-            }
-            const remainingMs = Math.max(1_000, seconds * 1_000 - (Date.now() - startedAt));
-            decision = await waitPanel(remainingMs);
-          }
-        }
-      }
     } finally {
-      cancel.signal.removeEventListener("abort", abortDialog);
-      dialogCancel.abort();
       this.approvals.delete(notice.id);
       const updated = this.activeTurn(agent);
       if (updated) {

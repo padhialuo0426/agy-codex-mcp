@@ -5,8 +5,7 @@
   "workspace_roots": [
     "/path/to/projects"
   ],
-  "approval_dialog": "/usr/bin/zenity",
-  "approval_mode": "panel_or_dialog",
+  "approval_mode": "panel",
   "approval_policy": "on-request",
   "approval_timeout_seconds": 300,
   "reuse_worktree_approval": true,

@@ -12,8 +12,8 @@ const kinds = {
   completed: "完成", failed: "失败", interrupted: "中断", resumed: "恢复",
   approval_requested: "请求审批", approval_approved: "已批准", approval_session: "本会话放行",
   approval_amend: "已按规则放行", approval_declined: "已拒绝",
-  approval_expired: "审批超时", approval_cancelled: "审批已取消", approval_unavailable: "审批不可用",
-  approval_auto_declined: "策略自动拒绝", approval_dialog_unavailable: "桌面弹窗不可用",
+  approval_expired: "审批超时", approval_cancelled: "审批已取消",
+  approval_auto_declined: "策略自动拒绝",
   unhandled_request: "未处理请求", closed: "关闭", time_limit: "超时", question_expired: "问题超时",
 };
 const approvalKindLabels = {
@@ -164,7 +164,7 @@ function render(next) {
 
 function showQuestion() {
   const agent = selected();
-  get("question").textContent = agent?.question?.text ?? (agent?.approvals?.length ? "请在本面板上方或本地审批窗口确认请求。" : "");
+  get("question").textContent = agent?.question?.text ?? (agent?.approvals?.length ? "请在本面板上方确认待审批请求。" : "");
   get("text").placeholder = agent?.question ? "回复当前问题" : "发消息或续派任务";
   document.querySelectorAll("[data-action], [data-mode]").forEach((button) => {
     button.disabled = !agent || (button.dataset.action === "changes" && !agent.worktree_path);

@@ -1,11 +1,7 @@
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
 import { message, record } from "./codex.js";
 import type { ApprovalChoice, ApprovalOption } from "./state.js";
 
-const execute = promisify(execFile);
-export type Decision = "once" | "session" | "amend" | "declined" | "expired" | "cancelled" | "unavailable";
-export type DialogOutcome = { decision: "once" | "declined" | "expired" | "cancelled" | "unavailable"; detail?: string };
+export type Decision = "once" | "session" | "amend" | "declined" | "expired" | "cancelled";
 
 export type ApprovalOffer = {
   kind: string;
@@ -19,50 +15,6 @@ export type ApprovalHandler = {
   declineReason?: string;
   respond: (choice: ApprovalChoice | "decline") => Record<string, unknown>;
 };
-
-export class ApprovalDialogs {
-  private next: Promise<unknown> = Promise.resolve();
-
-  constructor(private readonly command?: string) {}
-
-  async ask(details: Record<string, unknown>, timeout: number, cancel: AbortSignal): Promise<DialogOutcome> {
-    if (!this.command) return { decision: "unavailable", detail: "approval_dialog not configured" };
-    const command = this.command;
-    const text = JSON.stringify(details, null, 2).replace(/[\u007f-\u009f\u202a-\u202e\u2066-\u2069]/gu,
-      (ch) => "\\u" + ch.charCodeAt(0).toString(16).padStart(4, "0"));
-    if (text.length > 256_000) return { decision: "unavailable", detail: "approval details exceed dialog size limit" };
-    const show = async (): Promise<DialogOutcome> => {
-      if (cancel.aborted) return { decision: "cancelled" };
-      const expires = AbortSignal.timeout(timeout * 1_000);
-      const signal = AbortSignal.any([expires, cancel]);
-      const dialog = execute(command, [
-        "--text-info", "--title=Codex 子代理审批", "--width=880", "--height=560",
-        "--checkbox=我已查看请求详情，同意这一次操作", "--ok-label=批准一次", "--cancel-label=拒绝",
-      ], { signal, maxBuffer: 8_192 });
-      const stdin = dialog.child.stdin;
-      stdin?.on("error", () => undefined);
-      stdin?.end("请核对下面的请求范围。只有勾选确认并点击「批准一次」才会授权。\n\n" + text + "\n");
-      try {
-        await dialog;
-        return signal.aborted ? { decision: cancel.aborted ? "cancelled" : "expired" } : { decision: "once" };
-      } catch (error) {
-        if (cancel.aborted) return { decision: "cancelled" };
-        if (expires.aborted) return { decision: "expired" };
-        const code = typeof error === "object" && error !== null && "code" in error ? error.code : undefined;
-        if (code === 1) return { decision: "declined" };
-        const stderr = typeof error === "object" && error !== null && "stderr" in error && typeof error.stderr === "string"
-          ? error.stderr.trim().slice(0, 300) : "";
-        return {
-          decision: "unavailable",
-          detail: `dialog exit ${String(code ?? "unknown")}${stderr ? `: ${stderr}` : ""}`,
-        };
-      }
-    };
-    const response = this.next.then(show);
-    this.next = response.catch(() => undefined);
-    return response;
-  }
-}
 
 function sanitizePermissions(raw: Record<string, unknown>) {
   const granted: Record<string, unknown> = {};

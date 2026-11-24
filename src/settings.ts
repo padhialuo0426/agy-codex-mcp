@@ -17,8 +17,7 @@ const SettingsSchema = z.strictObject({
   writable_roots: z.array(z.string()).default([]),
   extra_writable_roots: z.array(z.string()).default([]),
   sandbox_network: z.boolean().default(false),
-  approval_dialog: z.string().refine(isAbsolute, "Use an absolute approval dialog path.").optional(),
-  approval_mode: z.enum(["off", "panel", "dialog", "panel_or_dialog"]).optional(),
+  approval_mode: z.enum(["off", "panel"]).default("panel"),
   approval_policy: z.enum(["on-request", "granular", "untrusted"]).default("on-request"),
   approvals_reviewer: z.enum(["user", "auto_review", "guardian_subagent"]).optional(),
   approval_timeout_seconds: z.number().int().min(5).max(600).default(120),
@@ -43,15 +42,10 @@ export function canWrite(settings: Settings, path: string) {
   return settings.writable_roots.some((root) => within(root, path));
 }
 
-export type ApprovalMode = "off" | "panel" | "dialog" | "panel_or_dialog";
-
-export function effectiveApprovalMode(settings: Settings): ApprovalMode {
-  if (settings.approval_mode) return settings.approval_mode;
-  return settings.approval_dialog ? "panel_or_dialog" : "off";
-}
+export type ApprovalMode = "off" | "panel";
 
 export function approvalsEnabled(settings: Settings): boolean {
-  return effectiveApprovalMode(settings) !== "off";
+  return settings.approval_mode !== "off";
 }
 
 export function loadSettings(): Settings {
@@ -60,9 +54,6 @@ export function loadSettings(): Settings {
   const config = SettingsSchema.parse(JSON.parse(readFileSync(values.config, "utf8")));
   for (const path of [config.codex, config.git, config.state_dir, ...config.workspace_roots, ...config.writable_roots, ...config.extra_writable_roots]) {
     if (!isAbsolute(path)) throw new Error("Use absolute paths in the desktop server configuration.");
-  }
-  if (config.approval_mode === "dialog" && !config.approval_dialog) {
-    throw new Error("approval_mode 'dialog' requires approval_dialog to be configured.");
   }
   mkdirSync(config.state_dir, { recursive: true, mode: 0o700 });
   config.state_dir = realpathSync(config.state_dir);

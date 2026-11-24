@@ -37,12 +37,12 @@ async function result<T extends Record<string, unknown>>(operation: () => T | Pr
 
 function createServer() {
   const server = new McpServer({ name: "agy-codex-mcp", version: "0.1.0" }, {
-    instructions: "Delegate bounded coding tasks to local Codex when the user asks for Codex or independent parallel work benefits the task. Supply the absolute path of the active project, scope, relevant context, and expected result. If the user requests a model or reasoning effort, discover choices with codex_models before spawning. Reuse the returned group_id for peers. Spawn is asynchronous. Continue other work, then call codex_wait and answer a question using codex_send with its reply_to ID. If a tool returns needs_approval, open or focus codex_panel for that group_id and tell the user to review the request in the Codex side panel or local desktop dialog, then continue waiting. Approvals are decided only by the user. Use codex_followup to start another turn. Report verified results and worktree diffs to the user. Use codex_panel to show the desktop agent view.",
+    instructions: "Delegate bounded coding tasks to local Codex when the user asks for Codex or independent parallel work benefits the task. Supply the absolute path of the active project, scope, relevant context, and expected result. If the user requests a model or reasoning effort, discover choices with codex_models before spawning. Reuse the returned group_id for peers. Spawn is asynchronous. Continue other work, then call codex_wait and answer a question using codex_send with its reply_to ID. If a tool returns needs_approval, open or focus codex_panel for that group_id and tell the user to review the request in the Codex side panel, then continue waiting. Approvals are decided only by the user. Use codex_followup to start another turn. Report verified results and worktree diffs to the user. Use codex_panel to show the desktop agent view.",
   });
 
   server.registerTool("codex_spawn", {
     title: "Start Codex subagent",
-    description: "Start an independent Codex agent in the background. Reuse group_id for peers. Default is read-only. Worktree mode requires a Git project. Allowlisted roots can start directly; other eligible projects can request a one-time desktop or side-panel approval. fork_from can copy a settled agent's Codex context in the same group.",
+    description: "Start an independent Codex agent in the background. Reuse group_id for peers. Default is read-only. Worktree mode requires a Git project. Allowlisted roots can start directly; other eligible projects can request a side-panel approval. fork_from can copy a settled agent's Codex context in the same group.",
     inputSchema: z.strictObject({
       group_id: group.optional(), workspace: limit(4_096).describe("Absolute directory of the current project or its checkout."),
       role: z.enum(["default", "explorer", "reviewer", "worker"]).default("default"),
