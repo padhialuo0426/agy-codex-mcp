@@ -1,5 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { EventEmitter } from "node:events";
+import { reapBridgeProcesses } from "./processes.js";
 import { ToolError, type Settings } from "./settings.js";
 
 type Envelope = Record<string, unknown>;
@@ -43,11 +44,16 @@ export class Codex extends EventEmitter {
     if (this.child?.stdin.writable) this.write({ id, error: { code: -32603, message: detail } });
   }
 
+  pid() {
+    return this.child?.pid;
+  }
+
   stop() {
     this.intentionalStop = true;
     const pid = this.child?.pid;
     if (pid) {
       try { process.kill(-pid, "SIGTERM"); } catch { /* Already gone. */ }
+      void reapBridgeProcesses(pid);
       const watchdog = setTimeout(() => {
         if (this.child?.pid === pid) {
           try { process.kill(-pid, "SIGKILL"); } catch { /* Already gone. */ }
@@ -79,6 +85,7 @@ export class Codex extends EventEmitter {
     ], {
       cwd: this.settings.state_dir,
       detached: true,
+      env: { ...process.env, AGY_CODEX_BRIDGE_PID: String(process.pid) },
       stdio: ["pipe", "pipe", "pipe"],
     });
     this.child = child;

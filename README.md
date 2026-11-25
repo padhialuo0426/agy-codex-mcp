@@ -1,14 +1,19 @@
 # Antigravity 的 Codex 子代理 (agy-codex-mcp)
 
-专为 Antigravity（`agy`）与 `/swarm` 打造的极简 Codex CLI MCP 桥接服务：无侧栏 GUI、无人工弹窗拦截，通过 5 个核心工具即可像原生子代理一样调用本地 Codex。
+专为 Antigravity（`agy`）与 `/swarm` 打造的极简 Codex CLI MCP 桥接服务：无侧栏 GUI、无人工弹窗拦截、超时自动回收残留子进程、交付后自动清理临时会话，通过 5 个核心工具即可像原生子代理一样调用本地 Codex。
 
 ## 核心工具（仅 5 个）
 
-1. **`codex_run`**：派工并等待完成（支持 `mode: "read_only" | "worktree" | "workspace"`）；传入 `agent_id` 可继续同一会话；传入 `background: true` 可立即返回并在后台并行运行。
+1. **`codex_run`**：派工并等待完成（支持 `mode: "read_only" | "worktree" | "workspace"`）；交付后默认自动释放临时会话与空工作树；若需多轮续聊可传 `keep_session: true`；传入 `background: true` 可立即返回并在后台并行运行。
 2. **`codex_wait`**：等待后台子代理，省略 `agent_ids` 与 `after` 时自动监听所有活跃子代理并从内部游标续读事件。
-3. **`codex_send`**：向子代理发消息（`mode: "auto"` 自动识别：若有待答问题则直接回复，无需 `reply_to`；运行中则转向 `turn/steer`；已结束则自动恢复并续派）。
-4. **`codex_manage`**：统一管理接口（`action: "list" | "changes" | "interrupt" | "close"`）。
+3. **`codex_send`**：向子代理发消息（`mode: "auto"` 自动识别：若有待答问题则直接回复，无需 `reply_to`；运行中则转向 `turn/steer`；保留会话已结束时自动续派）。
+4. **`codex_manage`**：统一管理接口（`action: "list" | "changes" | "interrupt" | "close" | "cleanup"`）。其中 `cleanup` 会删除历史持久化 Codex 会话、移除残留工作树并清理本地状态库。
 5. **`codex_models`**：查询当前 Codex 账号可用的模型 ID 与推理档位。
+
+## 会话不堆积与进程树回收
+
+- **不污染 ChatGPT Desktop 历史**：默认 `persist_threads: false`，所有子代理线程均以 `ephemeral: true` 启动，且在向主代理交付结果后（`keep_session` 默认 `false`）自动 `thread/unsubscribe` 并释放空工作树（保留有实际改动的 worktree 供主代理验收）。
+- **彻底回收超时/中断脚本**：每个子代理线程会注入 `AGY_CODEX_AGENT_ID` 与 `AGY_CODEX_BRIDGE_PID` 环境变量标签；当 `codex_run` 超时、请求被取消、`interrupt`、`close`、`turn/completed` 或桥接退出时，会扫描 `/proc` 环境变量与父子进程树，对关联进程组先发 `SIGTERM` 再升级 `SIGKILL`，防止脚本在子代理退出后继续残留。
 
 ## 沙箱与免审批策略
 
@@ -30,4 +35,5 @@
 1. 在项目目录运行 `pnpm install --frozen-lockfile && pnpm build`。
 2. 复制 `desktop.example.json` 为 `desktop.json` 并修改 `state_dir` 等本机路径。
 3. 运行 `node scripts/cc-switch.mjs --open` 导入 Antigravity MCP 配置，或将 `node dist/server.js --config /path/to/desktop.json` 写入 `mcp_config.json`。
-4. 本地验证：`pnpm test`（使用模拟 Codex App Server）。
+4. 若升级前曾在 ChatGPT Desktop 堆积了旧子代理会话，重启 MCP 后执行一次 `codex_manage({ action: "cleanup" })` 即可批量清理。
+5. 本地验证：`pnpm test`（使用模拟 Codex App Server）。

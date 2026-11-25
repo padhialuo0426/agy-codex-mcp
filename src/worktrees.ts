@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdirSync, realpathSync } from "node:fs";
+import { mkdirSync, realpathSync, rmSync } from "node:fs";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import { promisify } from "node:util";
 import { ToolError, within, workspace, type Settings } from "./settings.js";
@@ -80,4 +80,15 @@ export async function readChanges(settings: Settings, agent: Agent, path?: strin
   } catch {
     throw new ToolError("diff_failed", "Cannot read the worktree changes. Check the worktree path or request a single file.");
   }
+}
+
+export async function removeWorktree(settings: Settings, worktree: { repository: string; path: string }) {
+  try {
+    await git(settings, worktree.repository, ["worktree", "remove", "--force", worktree.path]);
+  } catch {
+    /* Fallback to direct directory removal if git metadata or repo moved. */
+  }
+  try {
+    rmSync(worktree.path, { recursive: true, force: true });
+  } catch { /* Ignore cleanup failure. */ }
 }

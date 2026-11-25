@@ -1,9 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import { Codex, message, output, record } from "./codex.js";
+import { reapAgentProcesses, reapBridgeProcesses } from "./processes.js";
 import { State, busy, ownerAlive, ownerId, type Agent, type AgentMode, type Role } from "./state.js";
 import { ToolError, workspace, type Settings } from "./settings.js";
-import { makeWorktree, planWorktree, readChanges } from "./worktrees.js";
+import { makeWorktree, planWorktree, readChanges, removeWorktree } from "./worktrees.js";
 
 const roles: Record<Role, string> = {
   default: "Carry out the delegated task and report the result with evidence.",
@@ -34,6 +35,7 @@ type RunArgs = {
   input_patch?: string;
   fork_from?: string;
   background: boolean;
+  keep_session?: boolean;
   timeout_seconds: number;
 };
 type WaitArgs = {
@@ -50,7 +52,7 @@ type SendArgs = {
   timeout_seconds: number;
 };
 type ManageArgs = {
-  action: "list" | "changes" | "interrupt" | "close";
+  action: "list" | "changes" | "interrupt" | "close" | "cleanup";
   agent_id?: string;
   path?: string;
   limit?: number;
@@ -86,13 +88,14 @@ export class Agents {
     if (this.stopping) return;
     this.stopping = true;
     this.recoverOwned();
+    void reapBridgeProcesses(this.codex.pid());
     this.codex.stop();
   }
 
   async run(args: RunArgs, signal?: AbortSignal) {
     if (this.stopping) throw new ToolError("server_stopping", "The MCP server is shutting down.");
     const agent = args.agent_id
-      ? await this.continueAgent(args.agent_id, args.task, args.context)
+      ? await this.continueAgent(args.agent_id, args.task, args.context, args.keep_session)
       : await this.spawnNew(args);
     if (args.background) return agent;
     return this.waitUntilSettled(agent.agent_id, args.timeout_seconds, signal);
@@ -100,7 +103,7 @@ export class Agents {
 
   async wait(args: WaitArgs, signal: AbortSignal) {
     const startCursor = args.after ?? this.lastWaitSeq;
-    let initial = args.agent_ids.length
+    const initial = args.agent_ids.length
       ? args.agent_ids.map((id) => this.state.require(id))
       : this.state.activeOwned();
     if (!initial.length) {
@@ -109,12 +112,15 @@ export class Agents {
         const cursor = events.at(-1)!.seq;
         this.lastWaitSeq = Math.max(this.lastWaitSeq, cursor);
         const ids = [...new Set(events.map((event) => event.agent_id))];
-        return {
-          reason: "all_finished",
-          cursor,
-          events,
-          agents: ids.map((id) => this.view(this.state.require(id))),
-        };
+        const settledViews = [];
+        for (const id of ids) {
+          const item = this.state.require(id);
+          if (!busy(item) && !item.keep_session && item.status !== "closed") {
+            await this.releaseAfterDelivery(item);
+          }
+          settledViews.push(this.view(this.state.require(id)));
+        }
+        return { reason: "all_finished", cursor, events, agents: settledViews };
       }
       return { reason: "idle", cursor: startCursor, events: [], agents: [] };
     }
@@ -130,11 +136,18 @@ export class Agents {
       if (done || needsInput || timedOut || (args.mode === "any" && events.length)) {
         const cursor = events.at(-1)?.seq ?? startCursor;
         this.lastWaitSeq = Math.max(this.lastWaitSeq, cursor);
+        if (done) {
+          for (const item of agents) {
+            if (!busy(item) && !item.keep_session && item.status !== "closed") {
+              await this.releaseAfterDelivery(item);
+            }
+          }
+        }
         return {
           reason: needsInput ? "needs_input" : done ? "all_finished" : (args.mode === "any" && events.length) ? "event" : "timeout",
           cursor,
           events,
-          agents: agents.map((agent) => this.view(agent)),
+          agents: targets.map((target) => this.view(this.state.require(target.id))),
         };
       }
       await delay(Math.min(200, Math.max(1, deadline - Date.now())), undefined, { signal });
@@ -182,6 +195,9 @@ export class Agents {
     if (args.action === "list") {
       return { agents: this.state.listRecent(args.limit ?? 20).map((agent) => this.view(agent)) };
     }
+    if (args.action === "cleanup") {
+      return this.cleanupSettled();
+    }
     const agentId = args.agent_id;
     if (!agentId) {
       throw new ToolError("agent_required", `Action '${args.action}' requires agent_id.`);
@@ -190,7 +206,10 @@ export class Agents {
       return readChanges(this.settings, this.state.require(agentId), args.path);
     }
     if (args.action === "interrupt") {
-      return this.exclusive(agentId, async () => this.stopTurn(this.owned(agentId)));
+      return this.exclusive(agentId, async () => {
+        const { view, reaped } = await this.stopTurnAndReap(this.owned(agentId), true);
+        return { ...view, reaped_processes: reaped };
+      });
     }
     return this.close(agentId);
   }
@@ -215,7 +234,8 @@ export class Agents {
 
   private async spawnNew(args: {
     workspace?: string; task: string; context?: string; mode: AgentMode; role: Role;
-    network?: boolean; model?: string; effort?: string; base?: string; input_patch?: string; fork_from?: string;
+    network?: boolean; model?: string; effort?: string; base?: string; input_patch?: string;
+    fork_from?: string; keep_session?: boolean;
   }, parent?: Agent) {
     if (!args.workspace) {
       throw new ToolError("workspace_required", "Provide workspace when starting a new agent, or pass agent_id to continue an existing one.");
@@ -227,19 +247,20 @@ export class Agents {
     const plan = args.mode === "worktree" ? await planWorktree(this.settings, cwd, args.base) : undefined;
     const selectedModel = await this.selectModel(cwd, args.model, args.effort);
     const id = randomUUID();
+    const ephemeral = !this.settings.persist_threads;
     const agent: Agent = {
       id, group: "default", role: args.role, mode: args.mode, task: args.task, workspace: cwd, cwd,
       status: "starting", owner: ownerId, generation: 1, settled: 0, queue: [],
       parent: parent?.id, depth: parent ? parent.depth + 1 : 1, model: selectedModel, effort: args.effort,
-      network: args.network,
+      network: args.network, ephemeral, keep_session: args.keep_session ?? false,
     };
     let source: Agent | undefined;
     this.state.change(() => {
       if (agent.depth > this.settings.max_depth) throw new ToolError("depth_limit", "Nested delegation has reached its configured depth limit.");
       if (args.fork_from) {
         source = this.state.require(args.fork_from);
-        if (!source.thread || busy(source) || source.workspace !== cwd) {
-          throw new ToolError("fork_unavailable", "Fork a settled Codex agent in the same workspace.");
+        if (!source.thread || busy(source) || source.workspace !== cwd || source.status === "closed") {
+          throw new ToolError("fork_unavailable", "Fork a live settled Codex agent in the same workspace (pass keep_session: true on the source agent).");
         }
       }
       this.checkCapacity();
@@ -268,13 +289,18 @@ export class Agents {
     });
   }
 
-  private async continueAgent(agentId: string, task: string, context?: string) {
+  private async continueAgent(agentId: string, task: string, context?: string, keepSession?: boolean) {
     return this.exclusive(agentId, async () => {
       const current = this.state.require(agentId);
       if (busy(current)) {
         throw new ToolError("agent_busy", "This agent is currently busy. Use codex_send or codex_wait instead.");
       }
       await this.resumeIfNeeded(agentId);
+      if (keepSession !== undefined) {
+        const latest = this.state.require(agentId);
+        latest.keep_session = keepSession;
+        this.state.save(latest);
+      }
       return this.startFollowupUnlocked(agentId, task, context);
     });
   }
@@ -299,6 +325,12 @@ export class Agents {
     let agent = this.state.require(id);
     if (agent.owner === ownerId && agent.status !== "closed" && agent.thread && this.byThread.has(agent.thread)) {
       return agent;
+    }
+    if (agent.ephemeral) {
+      throw new ToolError(
+        "session_closed",
+        "This ephemeral session was already closed after delivery. Start a new codex_run, or pass keep_session: true if you need multi-turn follow-ups.",
+      );
     }
     if (!agent.thread) throw new ToolError("no_saved_session", "This agent did not start a Codex session. Start a new agent.");
     const savedThread = agent.thread;
@@ -332,40 +364,146 @@ export class Agents {
     const initial = this.state.require(agentId);
     const targetGen = initial.generation;
     const deadline = Date.now() + timeoutSeconds * 1_000;
-    while (true) {
-      const current = this.state.require(agentId);
-      const done = current.settled >= targetGen || !ownerAlive(current.owner);
-      const needsInput = Boolean(current.question && ownerAlive(current.owner));
-      const timedOut = Date.now() >= deadline;
-      if (done || needsInput || timedOut) {
-        const view = this.view(current);
-        let changes: Record<string, unknown> | undefined;
-        if (current.worktree && current.settled >= targetGen) {
-          try {
-            changes = await readChanges(this.settings, current);
-          } catch { /* Ignore diff read failure on settled summary. */ }
+    try {
+      while (true) {
+        const current = this.state.require(agentId);
+        const done = current.settled >= targetGen || !ownerAlive(current.owner);
+        const needsInput = Boolean(current.question && ownerAlive(current.owner));
+        const timedOut = Date.now() >= deadline;
+        if (done || needsInput || timedOut) {
+          let reaped = 0;
+          const didTimeout = timedOut && !done && !needsInput;
+          if (didTimeout) {
+            reaped = await this.abortTurnAndReap(agentId);
+          }
+          const latest = this.state.require(agentId);
+          let changes: { tracked: string; untracked: string; diff: string; diff_truncated: boolean; base: string; worktree_path: string } | undefined;
+          if (latest.worktree && latest.settled >= targetGen) {
+            try {
+              changes = await readChanges(this.settings, latest);
+            } catch { /* Ignore diff read failure on settled summary. */ }
+          }
+          if (!needsInput && !latest.keep_session && latest.settled >= targetGen) {
+            await this.releaseAfterDelivery(latest, changes);
+          }
+          const finalView = this.view(this.state.require(agentId));
+          return {
+            ...finalView,
+            ...(didTimeout ? { timed_out: true, reaped_processes: reaped } : {}),
+            ...(changes ? { changes } : {}),
+          };
         }
-        return {
-          ...view,
-          ...(timedOut && !done && !needsInput ? { timed_out: true } : {}),
-          ...(changes ? { changes } : {}),
-        };
+        await delay(Math.min(150, Math.max(1, deadline - Date.now())), undefined, { signal });
       }
-      await delay(Math.min(150, Math.max(1, deadline - Date.now())), undefined, { signal });
+    } catch (error) {
+      if (signal?.aborted || (error instanceof Error && error.name === "AbortError")) {
+        await this.abortTurnAndReap(agentId).catch(() => 0);
+      }
+      throw error;
     }
+  }
+
+  private async abortTurnAndReap(agentId: string): Promise<number> {
+    const current = this.state.find(agentId);
+    if (!current) return 0;
+    let reaped = 0;
+    if (busy(current) && current.turn && current.thread && current.owner === ownerId && this.byThread.has(current.thread)) {
+      try {
+        reaped = (await this.stopTurnAndReap(current, true)).reaped;
+      } catch {
+        const after = this.state.find(agentId);
+        if (after && busy(after)) {
+          this.finish(after, "interrupted", after.last ?? "The turn was interrupted after timeout or cancellation.");
+        }
+        reaped = await reapAgentProcesses(agentId, this.codex.pid());
+      }
+    } else {
+      if (busy(current)) {
+        this.finish(current, "interrupted", current.last ?? "The turn was interrupted after timeout or cancellation.");
+      }
+      reaped = await reapAgentProcesses(agentId, this.codex.pid());
+    }
+    const after = this.state.find(agentId);
+    if (after && busy(after)) {
+      this.finish(after, "interrupted", after.last ?? "The turn was interrupted after timeout or cancellation.");
+    }
+    return reaped;
+  }
+
+  private async releaseAfterDelivery(
+    agent: Agent,
+    precomputedChanges?: { tracked: string; untracked: string },
+  ) {
+    const current = this.state.find(agent.id);
+    if (!current || busy(current)) return;
+    if (current.owner === ownerId && current.thread && this.byThread.has(current.thread)) {
+      await this.codex.request("thread/unsubscribe", { threadId: current.thread }).catch(() => undefined);
+      this.byThread.delete(current.thread);
+    }
+    if (!current.ephemeral && !this.settings.persist_threads && current.thread) {
+      await this.codex.request("thread/delete", { threadId: current.thread }).catch(() => undefined);
+    }
+    if (current.worktree) {
+      let empty = false;
+      try {
+        const summary = precomputedChanges ?? await readChanges(this.settings, current);
+        empty = summary.tracked.trim() === "" && summary.untracked.trim() === "";
+      } catch { /* Keep worktree if diff check fails. */ }
+      if (empty) {
+        await removeWorktree(this.settings, current.worktree);
+        current.worktree = undefined;
+      }
+    }
+    this.clearDeadline(current.id);
+    current.status = "closed";
+    current.owner = undefined;
+    current.turn = undefined;
+    current.question = undefined;
+    this.state.save(current);
+  }
+
+  private async cleanupSettled() {
+    let deleted_threads = 0;
+    let removed_worktrees = 0;
+    let pruned_agents = 0;
+    for (const agent of this.state.listAll()) {
+      if (ownerAlive(agent.owner) && busy(agent)) continue;
+      if (agent.owner === ownerId && agent.thread && this.byThread.has(agent.thread)) {
+        await this.codex.request("thread/unsubscribe", { threadId: agent.thread }).catch(() => undefined);
+        this.byThread.delete(agent.thread);
+      }
+      if (!agent.ephemeral && agent.thread) {
+        try {
+          await this.codex.request("thread/delete", { threadId: agent.thread });
+          deleted_threads++;
+        } catch { /* Thread may already be absent or deleted. */ }
+      }
+      if (agent.worktree) {
+        await removeWorktree(this.settings, agent.worktree);
+        removed_worktrees++;
+      }
+      this.clearDeadline(agent.id);
+      this.state.deleteAgent(agent.id);
+      pruned_agents++;
+    }
+    return { deleted_threads, removed_worktrees, pruned_agents };
   }
 
   private async close(id: string) {
     return this.exclusive(id, async () => {
       const agent = this.state.require(id);
-      if (agent.status === "closed") return this.view(agent);
+      if (agent.status === "closed") {
+        await reapAgentProcesses(id, this.codex.pid());
+        return this.view(agent);
+      }
       if (agent.owner && agent.owner !== ownerId && ownerAlive(agent.owner)) {
         throw new ToolError("other_connection", "Close this agent from its originating connection.");
       }
-      if (agent.owner === ownerId && busy(agent)) await this.stopTurn(agent, true);
+      if (agent.owner === ownerId && busy(agent)) await this.stopTurnAndReap(agent, true);
+      else await reapAgentProcesses(id, this.codex.pid());
       const current = this.state.require(id);
       if (current.owner === ownerId && current.thread) {
-        await this.codex.request("thread/unsubscribe", { threadId: current.thread });
+        await this.codex.request("thread/unsubscribe", { threadId: current.thread }).catch(() => undefined);
         this.byThread.delete(current.thread);
       }
       this.clearDeadline(id);
@@ -375,7 +513,7 @@ export class Agents {
       current.turn = undefined;
       current.question = undefined;
       this.state.save(current);
-      this.state.event(current, "closed", "Agent closed. Its saved session and workspace can be continued later.");
+      this.state.event(current, "closed", "Agent closed.");
       return this.view(current);
     });
   }
@@ -438,6 +576,8 @@ export class Agents {
       worktree_path: agent.worktree?.path,
       base_commit: agent.worktree?.base,
       network: Boolean(agent.network ?? this.settings.sandbox_network),
+      ephemeral: agent.ephemeral ?? !this.settings.persist_threads,
+      keep_session: Boolean(agent.keep_session),
     };
   }
 
@@ -471,6 +611,16 @@ export class Agents {
     const disable = (value: unknown) => Object.fromEntries(
       Object.keys(record(value)).map((key) => [key, { enabled: false }]),
     );
+    const existingShellEnv = record(effective.shell_environment_policy);
+    const existingSet = record(existingShellEnv.set);
+    const shell_environment_policy = {
+      ...existingShellEnv,
+      set: {
+        ...existingSet,
+        AGY_CODEX_AGENT_ID: agent.id,
+        AGY_CODEX_BRIDGE_PID: String(process.pid),
+      },
+    };
     const mode = this.agentMode(agent);
     const developerInstructions = [
       roles[agent.role],
@@ -493,8 +643,12 @@ export class Agents {
       sandbox,
       model: agent.model,
       developerInstructions,
-      ephemeral: false,
-      config: { mcp_servers: disable(effective.mcp_servers), plugins: disable(effective.plugins) },
+      ephemeral: agent.ephemeral ?? !this.settings.persist_threads,
+      config: {
+        mcp_servers: disable(effective.mcp_servers),
+        plugins: disable(effective.plugins),
+        shell_environment_policy,
+      },
     };
   }
 
@@ -580,31 +734,40 @@ export class Agents {
       const current = this.state.find(agent.id);
       if (!current || current.generation !== agent.generation || !busy(current)) return;
       this.state.event(current, "time_limit", "The configured turn deadline elapsed.");
-      void this.stopTurn(current).catch(() => this.codex.stop());
+      void this.abortTurnAndReap(current.id).catch(() => this.codex.stop());
     }, this.settings.max_turn_seconds * 1_000);
     this.deadlines.set(agent.id, timer);
   }
 
-  private async stopTurn(agent: Agent, waitForDone = false) {
-    if (!busy(agent)) return this.view(agent);
+  private async stopTurnAndReap(agent: Agent, waitForDone = false) {
+    if (!busy(agent)) {
+      const reaped = await reapAgentProcesses(agent.id, this.codex.pid());
+      return { view: this.view(agent), reaped };
+    }
     if (!agent.turn) throw new ToolError("agent_starting", "The turn is still being started. Retry after the running event.");
     this.interrupting.add(agent.id);
     try {
       await this.codex.request("turn/interrupt", { threadId: agent.thread, turnId: agent.turn });
     } catch (error) {
       this.interrupting.delete(agent.id);
+      const reaped = await reapAgentProcesses(agent.id, this.codex.pid());
       const current = this.state.require(agent.id);
-      if (!busy(current)) return this.view(current);
+      if (!busy(current)) return { view: this.view(current), reaped };
       throw error;
     }
+    const reaped = await reapAgentProcesses(agent.id, this.codex.pid());
     if (waitForDone) {
-      const deadline = Date.now() + 5_000;
+      const deadline = Date.now() + 2_000;
       while (busy(this.state.require(agent.id))) {
-        if (Date.now() >= deadline) throw new ToolError("interrupt_pending", "Codex acknowledged the interrupt. Wait for its terminal event before closing.");
+        if (Date.now() >= deadline) {
+          const stillBusy = this.state.require(agent.id);
+          if (busy(stillBusy)) this.finish(stillBusy, "interrupted", stillBusy.last ?? "The turn was interrupted.");
+          break;
+        }
         await delay(100);
       }
     }
-    return this.view(this.state.require(agent.id));
+    return { view: this.view(this.state.require(agent.id)), reaped };
   }
 
   private enqueue(agent: Agent, value: string) {
@@ -721,6 +884,7 @@ export class Agents {
       const status = turn.status === "interrupted" ? "interrupted" : turn.status === "completed" ? "completed" : "failed";
       const description = agent.last ?? message(record(turn.error).message) ?? `Codex turn ${status}.`;
       this.finish(agent, status, output(description));
+      void reapAgentProcesses(agent.id, this.codex.pid());
       if (agent.parent) {
         const parent = this.state.find(agent.parent);
         if (parent?.owner === ownerId && parent.thread && parent.status !== "closed") {

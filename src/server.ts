@@ -32,12 +32,12 @@ async function result<T extends Record<string, unknown>>(operation: () => T | Pr
 
 function createServer() {
   const server = new McpServer({ name: "agy-codex-mcp", version: "0.2.0" }, {
-    instructions: "Delegate coding tasks to local Codex without manual approvals. Use codex_run for a single-shot task (waits until finished or needs_input, returning result and any worktree diff), or pass background: true to launch parallel tasks and wait with codex_wait. Pass agent_id to codex_run to continue an existing agent. Use codex_send to answer a pending question (no reply_to ID needed), steer a running turn, or start a follow-up. Use codex_manage for list, changes, interrupt, and close. Discover models and effort options with codex_models when requested.",
+    instructions: "Delegate coding tasks to local Codex without manual approvals. Use codex_run for a single-shot task (waits until finished or needs_input, returning result and any worktree diff; threads are ephemeral and auto-closed on delivery unless keep_session: true is passed). Pass background: true to launch parallel tasks and wait with codex_wait. Pass agent_id with keep_session: true to continue an existing agent. Use codex_send to answer a pending question (no reply_to ID needed), steer a running turn, or start a follow-up. Use codex_manage for list, changes, interrupt, close, and cleanup (which deletes old persisted threads and removes leftover worktrees). Discover models and effort options with codex_models when requested.",
   });
 
   server.registerTool("codex_run", {
     title: "Run Codex subagent",
-    description: "Start a new Codex agent (supply workspace) or continue an existing one (supply agent_id). Defaults to blocking until completion or needs_input, returning the result and worktree changes. Set background: true for parallel delegation.",
+    description: "Start a new Codex agent (supply workspace) or continue an existing one (supply agent_id). Defaults to blocking until completion or needs_input, returning the result and worktree changes, and auto-closing ephemeral sessions on delivery. Set background: true for parallel delegation or keep_session: true for multi-turn follow-ups.",
     inputSchema: z.strictObject({
       agent_id: agent.optional().describe("Existing agent ID to continue instead of spawning a new one."),
       workspace: limit(4_096).optional().describe("Absolute project or work-copy directory. Required when agent_id is omitted."),
@@ -50,8 +50,9 @@ function createServer() {
       effort: limit(100).optional().describe("Reasoning effort value from codex_models."),
       base: limit(200).optional().describe("Git revision for worktree mode, defaults to HEAD."),
       input_patch: z.string().min(1).max(120_000).optional().describe("Explicit Git patch to apply when creating a worktree."),
-      fork_from: agent.optional().describe("Fork context from a settled agent in the same workspace."),
+      fork_from: agent.optional().describe("Fork context from a settled agent in the same workspace (requires keep_session: true on the source agent)."),
       background: z.boolean().default(false).describe("Return immediately instead of waiting for completion."),
+      keep_session: z.boolean().optional().describe("Keep the Codex thread alive after delivery for multi-turn follow-ups. Defaults to false for new runs."),
       timeout_seconds: z.number().int().min(1).max(600).default(120).describe("Wait timeout when background is false."),
     }),
     annotations: write,
@@ -84,9 +85,9 @@ function createServer() {
 
   server.registerTool("codex_manage", {
     title: "Manage Codex subagents",
-    description: "List recent/active agents, read a worktree diff (changes), interrupt a running turn, or close an agent.",
+    description: "List recent/active agents, read a worktree diff (changes), interrupt a running turn, close an agent, or cleanup settled/persisted threads and leftover worktrees.",
     inputSchema: z.strictObject({
-      action: z.enum(["list", "changes", "interrupt", "close"]),
+      action: z.enum(["list", "changes", "interrupt", "close", "cleanup"]),
       agent_id: agent.optional(),
       path: limit(2_000).optional().describe("Optional relative path filter for action='changes'."),
       limit: z.number().int().min(1).max(50).default(20).optional().describe("Max agents for action='list'."),

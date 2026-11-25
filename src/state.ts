@@ -26,6 +26,8 @@ export type Agent = {
   question?: { id: string; text: string };
   worktree?: { repository: string; path: string; base: string; git_dir?: string };
   network?: boolean;
+  ephemeral?: boolean;
+  keep_session?: boolean;
   parent?: string;
   depth: number;
   model?: string;
@@ -101,8 +103,7 @@ export class State {
   }
 
   listRecent(limit = 20): Agent[] {
-    const all = (this.db.prepare("SELECT data FROM agents ORDER BY rowid DESC").all() as Row[])
-      .map((row) => JSON.parse(row.data) as Agent);
+    const all = this.listAll();
     const active: Agent[] = [];
     const settled: Agent[] = [];
     for (const agent of all) {
@@ -110,6 +111,11 @@ export class State {
       else settled.push(agent);
     }
     return [...active, ...settled].slice(0, limit);
+  }
+
+  listAll(): Agent[] {
+    return (this.db.prepare("SELECT data FROM agents ORDER BY rowid DESC").all() as Row[])
+      .map((row) => JSON.parse(row.data) as Agent);
   }
 
   change(action: () => void) {
@@ -126,6 +132,13 @@ export class State {
   save(agent: Agent) {
     this.db.prepare(`INSERT INTO agents(id,agent_group,data) VALUES(?,?,?)
       ON CONFLICT(id) DO UPDATE SET data=excluded.data`).run(agent.id, agent.group, JSON.stringify(agent));
+  }
+
+  deleteAgent(id: string) {
+    this.change(() => {
+      this.db.prepare("DELETE FROM events WHERE agent_id = ?").run(id);
+      this.db.prepare("DELETE FROM agents WHERE id = ?").run(id);
+    });
   }
 
   event(agent: Agent, kind: string, text: string, questionId?: string) {

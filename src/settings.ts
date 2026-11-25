@@ -17,6 +17,7 @@ const SettingsSchema = z.strictObject({
   sandbox_mode: z.enum(["workspace-write", "danger-full-access"]).default("workspace-write"),
   sandbox_network: z.boolean().default(true),
   extra_writable_roots: z.array(z.string()).default([]),
+  persist_threads: z.boolean().default(false),
   allowed_models: z.array(z.string()).default([]),
   max_parallel: z.number().int().min(1).max(8).default(4),
   max_turn_seconds: z.number().int().min(10).max(3600).default(600),
