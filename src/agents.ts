@@ -4,6 +4,7 @@ import { Codex, message, output, record } from "./codex.js";
 import { reapAgentProcesses, reapBridgeProcesses } from "./processes.js";
 import { State, busy, ownerAlive, ownerId, type Agent, type AgentMode, type Role } from "./state.js";
 import { ToolError, workspace, type Settings } from "./settings.js";
+import { appendStream, buildWatchCommand, removeStream, type AgentActivity, type StreamChanges, type StreamEvent } from "./streams.js";
 import { makeWorktree, planWorktree, readChanges, removeWorktree } from "./worktrees.js";
 
 const roles: Record<Role, string> = {
@@ -39,12 +40,6 @@ type RunArgs = {
   wait_seconds: number;
   max_turn_seconds?: number;
 };
-type WaitArgs = {
-  agent_ids: string[];
-  mode: "any" | "all";
-  seconds: number;
-  after?: number;
-};
 type SendArgs = {
   agent_id: string;
   text: string;
@@ -53,11 +48,12 @@ type SendArgs = {
   wait_seconds: number;
 };
 type ManageArgs = {
-  action: "list" | "changes" | "interrupt" | "close" | "cleanup";
+  action: "status" | "list" | "changes" | "interrupt" | "close" | "cleanup";
   agent_id?: string;
   path?: string;
   limit?: number;
 };
+export type ProgressCallback = (elapsedSec: number, activity?: AgentActivity) => void;
 
 function itemText(label: string, text: string) {
   return `${label}:\n${text}`;
@@ -70,14 +66,15 @@ export class Agents {
   private readonly questions = new Map<string, PendingQuestion>();
   private readonly interrupting = new Set<string>();
   private readonly pendingAbort = new Map<string, Promise<number>>();
+  private readonly settling = new Map<string, Promise<void>>();
+  private readonly lastReaped = new Map<string, number>();
+  private readonly lastSeq = new Map<string, number>();
   private readonly deadlines = new Map<string, NodeJS.Timeout>();
   private readonly changing = new Set<string>();
-  private lastWaitSeq: number;
   private stopping = false;
 
   constructor(private readonly settings: Settings) {
     this.state = new State(settings.state_dir);
-    this.lastWaitSeq = this.state.latestSeq();
     this.codex = new Codex(settings);
     this.codex.on("notification", (method, params) => this.notify(method, params));
     this.codex.on("request", (id, method, params) => {
@@ -94,69 +91,25 @@ export class Agents {
     this.codex.stop();
   }
 
-  async run(args: RunArgs, signal?: AbortSignal) {
+  async run(args: RunArgs, signal?: AbortSignal, onProgress?: ProgressCallback) {
     if (this.stopping) throw new ToolError("server_stopping", "The MCP server is shutting down.");
+    const startCursor = this.state.latestSeq();
     const agent = args.agent_id
       ? await this.continueAgent(args.agent_id, args.task, args.context, args.keep_session, args.max_turn_seconds)
       : await this.spawnNew(args);
-    if (args.background || args.wait_seconds === 0) return agent;
-    return this.waitUntilSettled(agent.agent_id, args.wait_seconds, signal);
+    if (args.background || args.wait_seconds === 0) {
+      const cursor = this.currentSeq(agent.agent_id, startCursor);
+      return {
+        ...agent,
+        cursor,
+        watch_command: buildWatchCommand(this.settings.state_dir, agent.agent_id, cursor),
+      };
+    }
+    return this.waitUntilSettled(agent.agent_id, args.wait_seconds, startCursor, signal, onProgress);
   }
 
-  async wait(args: WaitArgs, signal: AbortSignal) {
-    const startCursor = args.after ?? this.lastWaitSeq;
-    const initial = args.agent_ids.length
-      ? args.agent_ids.map((id) => this.state.require(id))
-      : this.state.activeOwned();
-    if (!initial.length) {
-      const events = this.state.recentForAgents([], startCursor, 30);
-      if (events.length) {
-        const cursor = events.at(-1)!.seq;
-        this.lastWaitSeq = Math.max(this.lastWaitSeq, cursor);
-        const ids = [...new Set(events.map((event) => event.agent_id))];
-        const settledViews = [];
-        for (const id of ids) {
-          const item = this.state.require(id);
-          if (!busy(item) && !item.keep_session && item.status !== "closed") {
-            await this.releaseAfterDelivery(item);
-          }
-          settledViews.push(this.view(this.state.require(id)));
-        }
-        return { reason: "all_finished", cursor, events, agents: settledViews };
-      }
-      return { reason: "idle", cursor: startCursor, events: [], agents: [] };
-    }
-    const targets = initial.map((agent) => ({ id: agent.id, generation: agent.generation }));
-    const targetIds = targets.map((target) => target.id);
-    const deadline = Date.now() + args.seconds * 1_000;
-    while (true) {
-      const agents = targets.map((target) => this.state.require(target.id));
-      const events = this.state.recentForAgents(targetIds, startCursor, 30);
-      const done = agents.every((agent, index) => agent.settled >= targets[index].generation || !ownerAlive(agent.owner));
-      const needsInput = agents.some((agent) => agent.question && ownerAlive(agent.owner));
-      const timedOut = Date.now() >= deadline;
-      if (done || needsInput || timedOut || (args.mode === "any" && events.length)) {
-        const cursor = events.at(-1)?.seq ?? startCursor;
-        this.lastWaitSeq = Math.max(this.lastWaitSeq, cursor);
-        if (done) {
-          for (const item of agents) {
-            if (!busy(item) && !item.keep_session && item.status !== "closed") {
-              await this.releaseAfterDelivery(item);
-            }
-          }
-        }
-        return {
-          reason: needsInput ? "needs_input" : done ? "all_finished" : (args.mode === "any" && events.length) ? "event" : "timeout",
-          cursor,
-          events,
-          agents: targets.map((target) => this.view(this.state.require(target.id))),
-        };
-      }
-      await delay(Math.min(200, Math.max(1, deadline - Date.now())), undefined, { signal });
-    }
-  }
-
-  async send(args: SendArgs, signal?: AbortSignal) {
+  async send(args: SendArgs, signal?: AbortSignal, onProgress?: ProgressCallback) {
+    const startCursor = this.currentSeq(args.agent_id, 0);
     const outcome = await this.exclusive(args.agent_id, async () => {
       const agent = this.state.require(args.agent_id);
       if (args.mode === "auto" && agent.question) {
@@ -164,8 +117,8 @@ export class Agents {
         const pending = this.questions.get(ownedAgent.id);
         if (!pending) throw new ToolError("question_not_pending", "This question is no longer pending.");
         this.answer(ownedAgent, args.text, true);
-        this.state.event(ownedAgent, "answered", output(args.text, 1_000), pending.id);
-        return { delivery: "answer" as const, waitable: true, view: this.view(ownedAgent) };
+        this.emitEvent(ownedAgent, "answered", output(args.text, 1_000), { questionId: pending.id });
+        return { delivery: "answer" as const, waitable: true, view: this.view(this.state.require(ownedAgent.id)) };
       }
       if (args.mode === "steer" || (args.mode === "auto" && agent.status === "running" && agent.turn)) {
         const ownedAgent = this.owned(agent.id);
@@ -173,11 +126,11 @@ export class Agents {
           await this.codex.request("turn/steer", {
             threadId: ownedAgent.thread, expectedTurnId: ownedAgent.turn, input: inputs(args.text),
           });
-          this.state.event(ownedAgent, "steered", output(args.text, 1_000));
+          this.emitEvent(ownedAgent, "steered", output(args.text, 1_000));
           return { delivery: "steer" as const, waitable: false, view: this.view(this.state.require(ownedAgent.id)) };
         }
         this.enqueue(ownedAgent, args.text);
-        return { delivery: "queued" as const, waitable: false, view: this.view(ownedAgent) };
+        return { delivery: "queued" as const, waitable: false, view: this.view(this.state.require(ownedAgent.id)) };
       }
       if (busy(agent)) {
         throw new ToolError("agent_busy", "This agent is currently running. Use mode='steer' or wait for it to settle.");
@@ -188,14 +141,35 @@ export class Agents {
     });
 
     if (args.wait && outcome.waitable) {
-      return this.waitUntilSettled(args.agent_id, args.wait_seconds, signal);
+      return this.waitUntilSettled(args.agent_id, args.wait_seconds, startCursor, signal, onProgress);
     }
-    return { delivery: outcome.delivery, ...outcome.view };
+    const latest = this.state.require(args.agent_id);
+    const cursor = this.currentSeq(args.agent_id, startCursor);
+    return {
+      delivery: outcome.delivery,
+      ...this.view(latest),
+      ...(busy(latest) ? { cursor, watch_command: buildWatchCommand(this.settings.state_dir, args.agent_id, cursor) } : {}),
+    };
   }
 
   async manage(args: ManageArgs) {
     if (args.action === "list") {
-      return { agents: this.state.listRecent(args.limit ?? 20).map((agent) => this.view(agent)) };
+      return {
+        agents: this.state.listRecent(args.limit ?? 20).map((agent) => {
+          const v = this.view(agent);
+          return {
+            agent_id: v.agent_id,
+            role: v.role,
+            mode: v.mode,
+            status: v.status,
+            elapsed_seconds: v.elapsed_seconds,
+            activity: v.activity,
+            worktree_path: v.worktree_path,
+            question: v.question,
+            task: output(agent.followup_task ?? agent.task, 160),
+          };
+        }),
+      };
     }
     if (args.action === "cleanup") {
       return this.cleanupSettled();
@@ -204,13 +178,29 @@ export class Agents {
     if (!agentId) {
       throw new ToolError("agent_required", `Action '${args.action}' requires agent_id.`);
     }
+    if (args.action === "status") {
+      const pending = this.settling.get(agentId);
+      if (pending) await pending.catch(() => undefined);
+      const agent = this.state.require(agentId);
+      const recent_events = this.state.recentForAgents([agentId], 0, 15);
+      const view = this.view(agent);
+      const cursor = this.currentSeq(agentId, recent_events.at(-1)?.seq ?? 0);
+      return {
+        ...view,
+        recent_events,
+        ...(agent.last_changes ? { changes: agent.last_changes } : {}),
+        ...(busy(agent) ? { cursor, watch_command: buildWatchCommand(this.settings.state_dir, agentId, cursor) } : {}),
+      };
+    }
     if (args.action === "changes") {
       return readChanges(this.settings, this.state.require(agentId), args.path);
     }
     if (args.action === "interrupt") {
       return this.exclusive(agentId, async () => {
-        const { view, reaped } = await this.stopTurnAndReap(this.owned(agentId), true);
-        return { ...view, reaped_processes: reaped };
+        const reaped = await this.abortTurnAndReap(this.owned(agentId).id, "Codex turn interrupted.");
+        const pending = this.settling.get(agentId);
+        if (pending) await pending.catch(() => undefined);
+        return { ...this.view(this.state.require(agentId)), reaped_processes: reaped };
       });
     }
     return this.close(agentId);
@@ -232,6 +222,41 @@ export class Agents {
       }];
     });
     return { models, cursor: message(result.nextCursor) ?? null };
+  }
+
+  private currentSeq(agentId: string, fallback = 0): number {
+    return this.lastSeq.get(agentId) ?? fallback;
+  }
+
+  private emitEvent(
+    agent: Agent,
+    kind: StreamEvent["kind"],
+    text: string,
+    extra?: {
+      sqlKind?: string;
+      questionId?: string;
+      result?: string;
+      worktree_path?: string;
+      changes?: StreamChanges;
+      owner_pid?: number;
+    },
+  ): number {
+    const seq = this.state.event(agent, extra?.sqlKind ?? kind, text, extra?.questionId);
+    this.lastSeq.set(agent.id, seq);
+    appendStream(this.settings.state_dir, agent.id, {
+      seq,
+      at: new Date().toISOString(),
+      kind,
+      status: agent.status,
+      ...(extra?.owner_pid !== undefined ? { owner_pid: extra.owner_pid } : {}),
+      text,
+      ...(extra?.questionId ? { question_id: extra.questionId } : {}),
+      ...(agent.activity ? { activity: agent.activity } : {}),
+      ...(extra?.result !== undefined ? { result: extra.result } : {}),
+      ...(extra?.worktree_path ? { worktree_path: extra.worktree_path } : {}),
+      ...(extra?.changes ? { changes: extra.changes } : {}),
+    });
+    return seq;
   }
 
   private async spawnNew(args: {
@@ -268,7 +293,7 @@ export class Agents {
       }
       this.checkCapacity();
       this.state.save(agent);
-      this.state.event(agent, "starting", output(args.task, 1_000));
+      this.emitEvent(agent, "started", output(args.task, 1_000), { sqlKind: "starting", owner_pid: process.pid });
     });
     return this.launch(agent, async (current) => {
       if (plan) {
@@ -296,7 +321,7 @@ export class Agents {
     return this.exclusive(agentId, async () => {
       const current = this.state.require(agentId);
       if (busy(current)) {
-        throw new ToolError("agent_busy", "This agent is currently busy. Use codex_send or codex_wait instead.");
+        throw new ToolError("agent_busy", "This agent is currently busy. Use codex_send or codex_manage instead.");
       }
       await this.resumeIfNeeded(agentId);
       if (keepSession !== undefined || maxTurnSeconds !== undefined) {
@@ -319,8 +344,10 @@ export class Agents {
       agent.generation++;
       agent.turn = undefined;
       agent.last = undefined;
+      agent.last_changes = undefined;
+      agent.activity = undefined;
       this.state.save(agent);
-      this.state.event(agent, "starting", output(task, 1_000));
+      this.emitEvent(agent, "started", output(task, 1_000), { sqlKind: "starting", owner_pid: process.pid });
     });
     return this.launch(agent, (current) => this.startTurn(current, task, context));
   }
@@ -359,53 +386,107 @@ export class Agents {
     } catch (error) {
       const current = this.state.require(id);
       current.owner = undefined;
-      this.finish(current, "failed", this.describe(error));
+      void this.settleTurn(current.id, "failed", this.describe(error));
       throw error;
     }
   }
 
-  private async waitUntilSettled(agentId: string, waitSeconds: number, signal?: AbortSignal) {
+  private async waitUntilSettled(
+    agentId: string,
+    waitSeconds: number,
+    startCursor: number,
+    signal?: AbortSignal,
+    onProgress?: ProgressCallback,
+  ) {
     const initial = this.state.require(agentId);
     const targetGen = initial.generation;
-    const deadline = Date.now() + waitSeconds * 1_000;
+    const startedAt = Date.now();
+    const deadline = startedAt + waitSeconds * 1_000;
+    let lastProgressAt = startedAt;
     while (true) {
       const current = this.state.require(agentId);
       const done = current.settled >= targetGen || !ownerAlive(current.owner);
       const needsInput = Boolean(current.question && ownerAlive(current.owner));
       const timedOut = Date.now() >= deadline;
       if (timedOut && !done && !needsInput) {
+        const cursor = this.currentSeq(agentId, startCursor);
         return {
           ...this.view(current),
           still_running: true,
+          cursor,
+          watch_command: buildWatchCommand(this.settings.state_dir, agentId, cursor),
         };
       }
       if (done || needsInput) {
-        const aborting = this.pendingAbort.get(agentId);
-        if (aborting) await aborting.catch(() => 0);
-        const settledAgent = this.state.require(agentId);
-        let changes: { tracked: string; untracked: string; diff: string; diff_truncated: boolean; base: string; worktree_path: string } | undefined;
-        if (settledAgent.worktree && settledAgent.settled >= targetGen) {
-          try {
-            changes = await readChanges(this.settings, settledAgent);
-          } catch { /* Ignore diff read failure on settled summary. */ }
+        if (done) {
+          const pending = this.settling.get(agentId);
+          if (pending) await pending.catch(() => undefined);
+          const aborting = this.pendingAbort.get(agentId);
+          if (aborting) await aborting.catch(() => 0);
         }
-        if (!needsInput && !settledAgent.keep_session && settledAgent.settled >= targetGen) {
-          await this.releaseAfterDelivery(settledAgent, changes);
-        }
-        const finalView = this.view(this.state.require(agentId));
+        const finalAgent = this.state.require(agentId);
+        const events = this.state.recentForAgents([agentId], startCursor, 30);
+        const reports = events.filter((ev) => ev.kind === "report").map((ev) => ev.text);
+        const cursor = this.currentSeq(agentId, events.at(-1)?.seq ?? startCursor);
         return {
-          ...finalView,
-          ...(changes ? { changes } : {}),
+          ...this.view(finalAgent),
+          ...(finalAgent.last_changes ? { changes: finalAgent.last_changes } : {}),
+          ...(reports.length ? { reports } : {}),
+          ...(needsInput ? { cursor, watch_command: buildWatchCommand(this.settings.state_dir, agentId, cursor) } : {}),
         };
+      }
+      if (onProgress && Date.now() - lastProgressAt >= 15_000) {
+        lastProgressAt = Date.now();
+        onProgress(Math.round((lastProgressAt - startedAt) / 1_000), current.activity);
       }
       await delay(Math.min(150, Math.max(1, deadline - Date.now())), undefined, { signal });
     }
+  }
+
+  private settleTurn(agentId: string, status: "completed" | "failed" | "interrupted", description: string): Promise<void> {
+    const existing = this.settling.get(agentId);
+    if (existing) return existing;
+    const task = (async () => {
+      const current = this.state.find(agentId);
+      if (!current) return;
+      if (busy(current)) {
+        this.finish(current, status, description);
+      }
+      const reaped = await reapAgentProcesses(agentId, this.codex.pid());
+      if (reaped > 0) {
+        this.lastReaped.set(agentId, (this.lastReaped.get(agentId) ?? 0) + reaped);
+      }
+      const settledAgent = this.state.find(agentId);
+      if (!settledAgent) return;
+      let changes: StreamChanges | undefined;
+      if (settledAgent.worktree) {
+        try {
+          changes = await readChanges(this.settings, settledAgent);
+          settledAgent.last_changes = changes;
+          this.state.save(settledAgent);
+        } catch { /* Ignore diff read failure on settled summary. */ }
+      }
+      if (!settledAgent.keep_session) {
+        await this.releaseAfterDelivery(settledAgent, changes);
+      }
+      const finalAgent = this.state.require(agentId);
+      this.emitEvent(finalAgent, status, finalAgent.last ?? description, {
+        result: finalAgent.last ?? description,
+        worktree_path: finalAgent.worktree?.path,
+        changes: finalAgent.last_changes ?? changes,
+      });
+    })().finally(() => {
+      this.settling.delete(agentId);
+    });
+    this.settling.set(agentId, task);
+    return task;
   }
 
   private async abortTurnAndReap(agentId: string, reason?: string): Promise<number> {
     const existing = this.pendingAbort.get(agentId);
     if (existing) return existing;
     const task = (async () => {
+      this.lastReaped.set(agentId, 0);
       const current = this.state.find(agentId);
       if (!current) return 0;
       if (reason && !current.last) {
@@ -417,26 +498,21 @@ export class Agents {
         try {
           reaped = (await this.stopTurnAndReap(current, true)).reaped;
         } catch {
-          const after = this.state.find(agentId);
-          if (after && busy(after)) {
-            this.finish(after, "interrupted", reason ?? after.last ?? "The turn was interrupted.");
-          }
-          reaped = await reapAgentProcesses(agentId, this.codex.pid());
+          await this.settleTurn(agentId, "interrupted", reason ?? current.last ?? "The turn was interrupted.");
         }
       } else {
-        if (busy(current)) {
-          this.finish(current, "interrupted", reason ?? current.last ?? "The turn was interrupted.");
-        }
-        reaped = await reapAgentProcesses(agentId, this.codex.pid());
+        await this.settleTurn(agentId, "interrupted", reason ?? current.last ?? "The turn was interrupted.");
       }
+      const pendingSettle = this.settling.get(agentId);
+      if (pendingSettle) await pendingSettle.catch(() => undefined);
       const after = this.state.find(agentId);
       if (after && busy(after)) {
-        this.finish(after, "interrupted", reason ?? after.last ?? "The turn was interrupted.");
+        await this.settleTurn(agentId, "interrupted", reason ?? after.last ?? "The turn was interrupted.");
       } else if (after && reason && (!after.last || after.last === "Codex turn interrupted.")) {
         after.last = reason;
         this.state.save(after);
       }
-      return reaped;
+      return Math.max(reaped, this.lastReaped.get(agentId) ?? 0);
     })().finally(() => {
       this.pendingAbort.delete(agentId);
     });
@@ -466,6 +542,7 @@ export class Agents {
       if (empty) {
         await removeWorktree(this.settings, current.worktree);
         current.worktree = undefined;
+        current.last_changes = undefined;
       }
     }
     this.clearDeadline(current.id);
@@ -473,6 +550,7 @@ export class Agents {
     current.owner = undefined;
     current.turn = undefined;
     current.question = undefined;
+    current.activity = undefined;
     this.state.save(current);
   }
 
@@ -497,6 +575,9 @@ export class Agents {
         removed_worktrees++;
       }
       this.clearDeadline(agent.id);
+      this.lastSeq.delete(agent.id);
+      this.lastReaped.delete(agent.id);
+      removeStream(this.settings.state_dir, agent.id);
       this.state.deleteAgent(agent.id);
       pruned_agents++;
     }
@@ -515,6 +596,8 @@ export class Agents {
       }
       if (agent.owner === ownerId && busy(agent)) await this.stopTurnAndReap(agent, true);
       else await reapAgentProcesses(id, this.codex.pid());
+      const pendingSettle = this.settling.get(id);
+      if (pendingSettle) await pendingSettle.catch(() => undefined);
       const current = this.state.require(id);
       if (current.owner === ownerId && current.thread) {
         await this.codex.request("thread/unsubscribe", { threadId: current.thread }).catch(() => undefined);
@@ -526,8 +609,13 @@ export class Agents {
       current.owner = undefined;
       current.turn = undefined;
       current.question = undefined;
+      current.activity = undefined;
       this.state.save(current);
-      this.state.event(current, "closed", "Agent closed.");
+      this.emitEvent(current, "closed", "Agent closed.", {
+        result: current.last,
+        worktree_path: current.worktree?.path,
+        changes: current.last_changes,
+      });
       return this.view(current);
     });
   }
@@ -572,6 +660,15 @@ export class Agents {
 
   private view(agent: Agent) {
     const active = ownerAlive(agent.owner);
+    const elapsed_seconds = agent.turn_started_at && busy(agent)
+      ? Math.max(0, Math.round((Date.now() - Date.parse(agent.turn_started_at)) / 1_000))
+      : undefined;
+    const activity = agent.activity && busy(agent)
+      ? {
+        ...agent.activity,
+        elapsed_seconds: Math.max(0, Math.round((Date.now() - Date.parse(agent.activity.started_at)) / 1_000)),
+      }
+      : undefined;
     return {
       agent_id: agent.id,
       role: agent.role,
@@ -592,6 +689,8 @@ export class Agents {
       network: Boolean(agent.network ?? this.settings.sandbox_network),
       ephemeral: agent.ephemeral ?? !this.settings.persist_threads,
       keep_session: Boolean(agent.keep_session),
+      ...(elapsed_seconds !== undefined ? { elapsed_seconds } : {}),
+      ...(activity ? { activity } : {}),
     };
   }
 
@@ -737,16 +836,19 @@ export class Agents {
       return this.view(this.state.require(agent.id));
     } catch (error) {
       const failed = this.activeTurn(agent);
-      if (failed) this.finish(failed, "failed", this.describe(error));
+      if (failed) await this.settleTurn(failed.id, "failed", this.describe(error));
       throw error;
     }
   }
 
   private markStarted(agent: Agent, turn: string) {
+    const now = new Date().toISOString();
     agent.turn = turn;
     agent.status = "running";
+    agent.turn_started_at = now;
+    agent.activity = { kind: "thinking", detail: "Starting turn...", started_at: now, steps: agent.activity?.steps ?? 0 };
     this.state.save(agent);
-    this.state.event(agent, "running", "Codex started the turn.");
+    this.emitEvent(agent, "started", "Codex started the turn.", { sqlKind: "running", owner_pid: process.pid });
     this.clearDeadline(agent.id);
     const limitSeconds = agent.max_turn_seconds ?? this.settings.max_turn_seconds;
     const timer = setTimeout(() => {
@@ -775,18 +877,19 @@ export class Agents {
       throw error;
     }
     const reaped = await reapAgentProcesses(agent.id, this.codex.pid());
+    if (reaped > 0) this.lastReaped.set(agent.id, (this.lastReaped.get(agent.id) ?? 0) + reaped);
     if (waitForDone) {
       const deadline = Date.now() + 2_000;
       while (busy(this.state.require(agent.id))) {
         if (Date.now() >= deadline) {
           const stillBusy = this.state.require(agent.id);
-          if (busy(stillBusy)) this.finish(stillBusy, "interrupted", stillBusy.last ?? "The turn was interrupted.");
+          if (busy(stillBusy)) await this.settleTurn(stillBusy.id, "interrupted", stillBusy.last ?? "The turn was interrupted.");
           break;
         }
         await delay(100);
       }
     }
-    return { view: this.view(this.state.require(agent.id)), reaped };
+    return { view: this.view(this.state.require(agent.id)), reaped: Math.max(reaped, this.lastReaped.get(agent.id) ?? 0) };
   }
 
   private enqueue(agent: Agent, value: string) {
@@ -803,6 +906,7 @@ export class Agents {
     this.questions.delete(agent.id);
     agent.question = undefined;
     if (agent.status === "needs_input") agent.status = "running";
+    agent.activity = { kind: "thinking", detail: "Resuming after parent reply...", started_at: new Date().toISOString(), steps: agent.activity?.steps ?? 0 };
     this.state.save(agent);
     this.codex.reply(pending.rpc, { success, contentItems: [{ type: "inputText", text }] });
   }
@@ -838,7 +942,7 @@ export class Agents {
     const text = message(tool === "ask_parent" ? args.question : tool === "delegate_child" ? args.task : args.text)?.trim();
     if (!text || text.length > 6_000) { reply("Provide 1 to 6000 characters.", false); return; }
     if (tool === "report_to_parent") {
-      this.state.event(agent, "report", text);
+      this.emitEvent(agent, "report", text);
       reply("Delivered to the parent's mailbox.");
     } else if (tool === "ask_parent") {
       if (this.questions.has(agent.id)) { reply("One question is already waiting for a reply.", false); return; }
@@ -852,8 +956,14 @@ export class Agents {
       this.questions.set(agent.id, { id: questionId, rpc: id, timer });
       agent.status = "needs_input";
       agent.question = { id: questionId, text };
+      agent.activity = {
+        kind: "waiting_input",
+        detail: output(text, 200),
+        started_at: new Date().toISOString(),
+        steps: agent.activity?.steps ?? 0,
+      };
       this.state.save(agent);
-      this.state.event(agent, "question", text, questionId);
+      this.emitEvent(agent, "question", text, { questionId });
     } else if (tool === "message_peer") {
       try {
         const peer = this.owned(message(args.agent_id) ?? "");
@@ -889,21 +999,90 @@ export class Agents {
       return;
     }
     if (agent.turn && (params.turnId ?? turn.id) && (params.turnId ?? turn.id) !== agent.turn) return;
-    if (method === "item/completed") {
+    if (method === "item/started") {
       const item = record(params.item);
-      const text = message(item.text);
-      if (item.type === "agentMessage" && text) {
-        if (item.phase === "commentary") this.state.event(agent, "commentary", output(text, 2_000));
-        else {
-          agent.last = output(text);
-          this.state.save(agent);
+      const type = message(item.type);
+      const now = new Date().toISOString();
+      if (type === "commandExecution") {
+        const rawCmd = message(item.command) ?? message(record(item.command).cmd) ?? "running command";
+        agent.activity = {
+          kind: "command",
+          detail: output(rawCmd.trim(), 200),
+          started_at: now,
+          steps: (agent.activity?.steps ?? 0) + 1,
+        };
+        this.state.save(agent);
+        appendStream(this.settings.state_dir, agent.id, {
+          seq: this.currentSeq(agent.id),
+          at: now,
+          kind: "activity",
+          status: agent.status,
+          activity: agent.activity,
+        });
+      } else if (type === "fileChange") {
+        const changes = Array.isArray(item.changes) ? item.changes.map(record) : [];
+        const paths = changes.map((c) => message(c.path)).filter((p): p is string => Boolean(p)).slice(0, 3);
+        const detail = paths.length
+          ? `Editing ${paths.join(", ")}${changes.length > 3 ? ` (+${changes.length - 3})` : ""}`
+          : "Applying file changes";
+        agent.activity = {
+          kind: "file_change",
+          detail: output(detail, 200),
+          started_at: now,
+          steps: (agent.activity?.steps ?? 0) + 1,
+        };
+        this.state.save(agent);
+        appendStream(this.settings.state_dir, agent.id, {
+          seq: this.currentSeq(agent.id),
+          at: now,
+          kind: "activity",
+          status: agent.status,
+          activity: agent.activity,
+        });
+      }
+    } else if (method === "item/completed") {
+      const item = record(params.item);
+      const type = message(item.type);
+      const now = new Date().toISOString();
+      if (type === "commandExecution" || type === "fileChange") {
+        agent.activity = {
+          kind: "thinking",
+          detail: "Processing tool output...",
+          started_at: now,
+          steps: agent.activity?.steps ?? 0,
+        };
+        this.state.save(agent);
+      } else if (type === "agentMessage") {
+        const text = message(item.text);
+        if (text) {
+          if (item.phase === "commentary") {
+            agent.activity = {
+              kind: "thinking",
+              detail: output(text, 200),
+              started_at: now,
+              steps: agent.activity?.steps ?? 0,
+            };
+            this.state.save(agent);
+            const seq = this.state.event(agent, "commentary", output(text, 2_000));
+            this.lastSeq.set(agent.id, seq);
+            appendStream(this.settings.state_dir, agent.id, {
+              seq,
+              at: now,
+              kind: "activity",
+              status: agent.status,
+              text: output(text, 500),
+              activity: agent.activity,
+            });
+          } else {
+            agent.last = output(text);
+            this.state.save(agent);
+          }
         }
       }
     } else if (method === "turn/completed") {
       const status = turn.status === "interrupted" ? "interrupted" : turn.status === "completed" ? "completed" : "failed";
       const description = agent.last ?? message(record(turn.error).message) ?? `Codex turn ${status}.`;
-      this.finish(agent, status, output(description));
-      void reapAgentProcesses(agent.id, this.codex.pid());
+      void this.settleTurn(agent.id, status, output(description));
       if (agent.parent) {
         const parent = this.state.find(agent.parent);
         if (parent?.owner === ownerId && parent.thread && parent.status !== "closed") {
@@ -941,6 +1120,7 @@ export class Agents {
     this.clearDeadline(agent.id);
     agent.question = undefined;
     agent.turn = undefined;
+    agent.activity = undefined;
     agent.last = text;
     agent.status = status;
     if (!agent.thread) agent.owner = undefined;
@@ -955,6 +1135,7 @@ export class Agents {
       if (busy(agent)) {
         void reapAgentProcesses(agent.id);
         this.finish(agent, "interrupted", "The Codex connection closed. Continue the saved agent to start another turn.");
+        this.emitEvent(agent, "interrupted", agent.last ?? "The Codex connection closed.", { result: agent.last });
       } else {
         this.state.save(agent);
       }

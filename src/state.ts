@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { ToolError } from "./settings.js";
+import type { AgentActivity, StreamChanges } from "./streams.js";
 
 export type AgentStatus = "starting" | "running" | "needs_input" | "idle" | "completed" | "failed" | "interrupted" | "closed";
 export type AgentMode = "read_only" | "worktree" | "workspace";
@@ -29,6 +30,9 @@ export type Agent = {
   ephemeral?: boolean;
   keep_session?: boolean;
   max_turn_seconds?: number;
+  turn_started_at?: string;
+  activity?: AgentActivity;
+  last_changes?: StreamChanges;
   parent?: string;
   depth: number;
   model?: string;
@@ -142,9 +146,10 @@ export class State {
     });
   }
 
-  event(agent: Agent, kind: string, text: string, questionId?: string) {
-    this.db.prepare("INSERT INTO events(agent_group,agent_id,generation,kind,text,question_id,at) VALUES(?,?,?,?,?,?,?)")
+  event(agent: Agent, kind: string, text: string, questionId?: string): number {
+    const result = this.db.prepare("INSERT INTO events(agent_group,agent_id,generation,kind,text,question_id,at) VALUES(?,?,?,?,?,?,?)")
       .run(agent.group, agent.id, agent.generation, kind, text, questionId ?? null, new Date().toISOString());
+    return Number(result.lastInsertRowid);
   }
 
   latestSeq(): number {

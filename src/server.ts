@@ -1,7 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/server";
 import { serveStdio } from "@modelcontextprotocol/server/stdio";
 import * as z from "zod/v4";
-import { Agents } from "./agents.js";
+import { Agents, type ProgressCallback } from "./agents.js";
 import { loadSettings, ToolError } from "./settings.js";
 
 const settings = loadSettings();
@@ -30,14 +30,33 @@ async function result<T extends Record<string, unknown>>(operation: () => T | Pr
   }
 }
 
+function makeProgress(
+  ctx: { mcpReq: { _meta?: { progressToken?: string | number }; notify: (n: { method: string; params?: Record<string, unknown> }) => Promise<void> } },
+  total: number,
+): ProgressCallback | undefined {
+  const progressToken = ctx.mcpReq._meta?.progressToken;
+  if (progressToken === undefined) return undefined;
+  return (elapsedSec, activity) => {
+    void ctx.mcpReq.notify({
+      method: "notifications/progress",
+      params: {
+        progressToken,
+        progress: elapsedSec,
+        total,
+        message: activity ? `${activity.kind}: ${activity.detail}` : `Running (${elapsedSec}s)`,
+      },
+    }).catch(() => undefined);
+  };
+}
+
 function createServer() {
-  const server = new McpServer({ name: "agy-codex-mcp", version: "0.2.0" }, {
-    instructions: "Delegate coding tasks to local Codex without manual approvals. Use codex_run for a single-shot task (waits up to wait_seconds; if still running, returns still_running: true WITHOUT killing the agent, so long scripts continue safely in the background for codex_wait). Set max_turn_seconds only as a hard execution ceiling (exceeding it interrupts the turn and terminates child scripts). Ephemeral sessions auto-close on delivery unless keep_session: true is passed. Use codex_send to answer a pending question (no reply_to ID needed), steer a running turn, or start a follow-up. Use codex_manage for list, changes, interrupt, close, and cleanup. Discover models and effort options with codex_models when requested.",
+  const server = new McpServer({ name: "agy-codex-mcp", version: "0.3.0" }, {
+    instructions: "Delegate coding tasks to local Codex without manual approvals or polling loops. Call codex_run (waits up to wait_seconds; returns result and diff when done, or still_running: true with watch_command if a long script is still active — never poll in a loop; run watch_command via a background shell task for zero-token reactive wakeup). Use codex_send to steer a running turn in real time (mode: 'steer'), answer ask_parent questions (no reply_to ID needed), or follow up. Use codex_manage for status (live activity & events), list, changes, interrupt, close, and cleanup. Discover models with codex_models when requested.",
   });
 
   server.registerTool("codex_run", {
     title: "Run Codex subagent",
-    description: "Start a new Codex agent (supply workspace) or continue an existing one (supply agent_id). Waits up to wait_seconds before returning still_running: true without killing long-running scripts. Ephemeral sessions auto-close after delivery unless keep_session: true is set.",
+    description: "Start a new Codex agent (supply workspace) or continue an existing one (supply agent_id). Waits up to wait_seconds before returning still_running: true with a zero-polling watch_command. Ephemeral sessions auto-close after delivery unless keep_session: true is set.",
     inputSchema: z.strictObject({
       agent_id: agent.optional().describe("Existing agent ID to continue instead of spawning a new one."),
       workspace: limit(4_096).optional().describe("Absolute project or work-copy directory. Required when agent_id is omitted."),
@@ -51,44 +70,32 @@ function createServer() {
       base: limit(200).optional().describe("Git revision for worktree mode, defaults to HEAD."),
       input_patch: z.string().min(1).max(120_000).optional().describe("Explicit Git patch to apply when creating a worktree."),
       fork_from: agent.optional().describe("Fork context from a settled agent in the same workspace (requires keep_session: true on the source agent)."),
-      background: z.boolean().default(false).describe("Return immediately instead of waiting for completion."),
+      background: z.boolean().default(false).describe("Return immediately with agent_id and watch_command."),
       keep_session: z.boolean().optional().describe("Keep the Codex thread alive after delivery for multi-turn follow-ups. Defaults to false for new runs."),
-      wait_seconds: z.number().int().min(0).max(300).default(60).describe("Seconds to wait synchronously before returning with still_running: true (0 = return immediately). Does NOT interrupt or kill the agent."),
-      max_turn_seconds: z.number().int().min(1).max(14_400).optional().describe("Hard execution deadline in seconds for this turn. When exceeded, the turn is interrupted and all child scripts spawned by the agent are terminated. Defaults to server max_turn_seconds."),
+      wait_seconds: z.number().int().min(0).max(300).default(90).describe("Seconds to wait synchronously before returning still_running: true and watch_command (0 = immediate return). Does NOT kill running scripts."),
+      max_turn_seconds: z.number().int().min(1).max(14_400).optional().describe("Hard execution deadline in seconds for this turn. When exceeded, the turn is interrupted and child scripts are terminated."),
     }),
     annotations: write,
-  }, (args, ctx) => result(() => agents.run(args, ctx.mcpReq.signal)));
-
-  server.registerTool("codex_wait", {
-    title: "Wait for background Codex agents",
-    description: "Wait for background Codex agents and return incremental events. Omit agent_ids to watch all currently active agents, and omit after to resume from the automatic cursor.",
-    inputSchema: z.strictObject({
-      agent_ids: z.array(agent).max(32).default([]),
-      mode: z.enum(["any", "all"]).default("all").describe("all waits for all targets to settle or ask a question; any returns on the first new event."),
-      seconds: z.number().int().min(0).max(25).default(25),
-      after: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).optional(),
-    }),
-    annotations: readOnly,
-  }, (args, ctx) => result(() => agents.wait(args, ctx.mcpReq.signal)));
+  }, (args, ctx) => result(() => agents.run(args, ctx.mcpReq.signal, makeProgress(ctx, args.wait_seconds))));
 
   server.registerTool("codex_send", {
     title: "Message or answer Codex subagent",
-    description: "Send input to a Codex agent. In auto mode (default), answers any pending question directly, steers a running turn, or starts a follow-up on a settled agent.",
+    description: "Send input to a Codex agent. In auto mode (default), answers any pending question directly, steers a running turn in real time, or starts a follow-up on a settled agent.",
     inputSchema: z.strictObject({
       agent_id: agent,
       text: limit(6_000),
       mode: z.enum(["auto", "steer", "followup"]).default("auto"),
       wait: z.boolean().default(false).describe("Wait for completion after answering or starting a follow-up."),
-      wait_seconds: z.number().int().min(0).max(300).default(60).describe("Seconds to wait synchronously when wait is true. Does NOT kill the agent if still running."),
+      wait_seconds: z.number().int().min(0).max(300).default(90).describe("Seconds to wait synchronously when wait is true."),
     }),
     annotations: localWrite,
-  }, (args, ctx) => result(() => agents.send(args, ctx.mcpReq.signal)));
+  }, (args, ctx) => result(() => agents.send(args, ctx.mcpReq.signal, makeProgress(ctx, args.wait_seconds))));
 
   server.registerTool("codex_manage", {
     title: "Manage Codex subagents",
-    description: "List recent/active agents, read a worktree diff (changes), interrupt a running turn, close an agent, or cleanup settled/persisted threads and leftover worktrees.",
+    description: "Inspect live status/activity and recent events (status), list recent agents (list), read worktree diff (changes), interrupt a turn (interrupt), close an agent (close), or purge old persisted threads/worktrees (cleanup).",
     inputSchema: z.strictObject({
-      action: z.enum(["list", "changes", "interrupt", "close", "cleanup"]),
+      action: z.enum(["status", "list", "changes", "interrupt", "close", "cleanup"]),
       agent_id: agent.optional(),
       path: limit(2_000).optional().describe("Optional relative path filter for action='changes'."),
       limit: z.number().int().min(1).max(50).default(20).optional().describe("Max agents for action='list'."),
