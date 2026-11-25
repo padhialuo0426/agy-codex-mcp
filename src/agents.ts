@@ -611,8 +611,12 @@ export class Agents {
     const disable = (value: unknown) => Object.fromEntries(
       Object.keys(record(value)).map((key) => [key, { enabled: false }]),
     );
-    const existingShellEnv = record(effective.shell_environment_policy);
-    const existingSet = record(existingShellEnv.set);
+    const existingShellEnv = Object.fromEntries(
+      Object.entries(record(effective.shell_environment_policy)).filter(([, value]) => value !== null && value !== undefined),
+    );
+    const existingSet = Object.fromEntries(
+      Object.entries(record(existingShellEnv.set)).filter(([, value]) => typeof value === "string"),
+    );
     const shell_environment_policy = {
       ...existingShellEnv,
       set: {
