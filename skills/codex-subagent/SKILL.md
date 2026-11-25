@@ -15,9 +15,10 @@ Use this skill when delegating tasks to local Codex (`agy-codex-mcp`) or bridgin
 
 - `codex_run`: Start a new Codex agent (`workspace` + `task`) or continue an existing one (`agent_id` + `task`).
   - `mode`: `"read_only"` (default), `"worktree"` (isolated Git worktree + auto diff on finish), or `"workspace"` (direct edit inside `workspace`).
-  - `background`: `false` (default, waits until completion or `needs_input`) or `true` (returns `agent_id` immediately).
+  - `wait_seconds`: Synchronous wait window (default `60`, `0` = immediate return). If a healthy script takes longer, `codex_run` returns `still_running: true` **without killing it** so you can continue waiting with `codex_wait`.
+  - `max_turn_seconds`: Optional hard execution deadline (up to `14400`s) for long builds/simulations. Exceeding `max_turn_seconds` (or calling `interrupt` / `close`) terminates the turn and reaps all child scripts.
+  - `background`: `false` (default) or `true` (returns `agent_id` immediately).
   - `keep_session`: `false` by default — threads run `ephemeral: true` and auto-close after delivering results (so sessions do not pile up in ChatGPT Desktop). Pass `keep_session: true` only when you need multi-turn follow-ups or `fork_from`.
-  - Timeout / cancellation automatically interrupts the turn and reaps child scripts spawned by the subagent.
 - `codex_wait`: Wait on background Codex agents. Omit `agent_ids` and `after` to watch all active agents from the automatic cursor.
 - `codex_send`: Answer a pending `ask_parent` question directly (no `reply_to` needed), steer a running turn, or start a follow-up (`wait: true` blocks until settled).
 - `codex_manage`: `action: "list" | "changes" | "interrupt" | "close" | "cleanup"`. Use `cleanup` to delete old persisted Codex threads and remove leftover worktrees.

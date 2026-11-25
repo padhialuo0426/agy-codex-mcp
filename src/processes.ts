@@ -163,9 +163,11 @@ async function reapByMatcher(
     finalSeeds.push(...matcher(entry, finalTable, finalProtected));
   }
   const finalTargets = expandDescendants(finalTable, finalSeeds, finalProtected);
-  for (const pid of signalMatches(finalTable, finalTargets, protectedPgids, "SIGKILL")) {
+  const killed = signalMatches(finalTable, finalTargets, protectedPgids, "SIGKILL");
+  for (const pid of killed) {
     reaped.add(pid);
   }
+  if (killed.size > 0) await delay(30);
   return reaped.size;
 }
 

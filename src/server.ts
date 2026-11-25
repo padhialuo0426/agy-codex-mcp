@@ -32,12 +32,12 @@ async function result<T extends Record<string, unknown>>(operation: () => T | Pr
 
 function createServer() {
   const server = new McpServer({ name: "agy-codex-mcp", version: "0.2.0" }, {
-    instructions: "Delegate coding tasks to local Codex without manual approvals. Use codex_run for a single-shot task (waits until finished or needs_input, returning result and any worktree diff; threads are ephemeral and auto-closed on delivery unless keep_session: true is passed). Pass background: true to launch parallel tasks and wait with codex_wait. Pass agent_id with keep_session: true to continue an existing agent. Use codex_send to answer a pending question (no reply_to ID needed), steer a running turn, or start a follow-up. Use codex_manage for list, changes, interrupt, close, and cleanup (which deletes old persisted threads and removes leftover worktrees). Discover models and effort options with codex_models when requested.",
+    instructions: "Delegate coding tasks to local Codex without manual approvals. Use codex_run for a single-shot task (waits up to wait_seconds; if still running, returns still_running: true WITHOUT killing the agent, so long scripts continue safely in the background for codex_wait). Set max_turn_seconds only as a hard execution ceiling (exceeding it interrupts the turn and terminates child scripts). Ephemeral sessions auto-close on delivery unless keep_session: true is passed. Use codex_send to answer a pending question (no reply_to ID needed), steer a running turn, or start a follow-up. Use codex_manage for list, changes, interrupt, close, and cleanup. Discover models and effort options with codex_models when requested.",
   });
 
   server.registerTool("codex_run", {
     title: "Run Codex subagent",
-    description: "Start a new Codex agent (supply workspace) or continue an existing one (supply agent_id). Defaults to blocking until completion or needs_input, returning the result and worktree changes, and auto-closing ephemeral sessions on delivery. Set background: true for parallel delegation or keep_session: true for multi-turn follow-ups.",
+    description: "Start a new Codex agent (supply workspace) or continue an existing one (supply agent_id). Waits up to wait_seconds before returning still_running: true without killing long-running scripts. Ephemeral sessions auto-close after delivery unless keep_session: true is set.",
     inputSchema: z.strictObject({
       agent_id: agent.optional().describe("Existing agent ID to continue instead of spawning a new one."),
       workspace: limit(4_096).optional().describe("Absolute project or work-copy directory. Required when agent_id is omitted."),
@@ -53,7 +53,8 @@ function createServer() {
       fork_from: agent.optional().describe("Fork context from a settled agent in the same workspace (requires keep_session: true on the source agent)."),
       background: z.boolean().default(false).describe("Return immediately instead of waiting for completion."),
       keep_session: z.boolean().optional().describe("Keep the Codex thread alive after delivery for multi-turn follow-ups. Defaults to false for new runs."),
-      timeout_seconds: z.number().int().min(1).max(600).default(120).describe("Wait timeout when background is false."),
+      wait_seconds: z.number().int().min(0).max(300).default(60).describe("Seconds to wait synchronously before returning with still_running: true (0 = return immediately). Does NOT interrupt or kill the agent."),
+      max_turn_seconds: z.number().int().min(1).max(14_400).optional().describe("Hard execution deadline in seconds for this turn. When exceeded, the turn is interrupted and all child scripts spawned by the agent are terminated. Defaults to server max_turn_seconds."),
     }),
     annotations: write,
   }, (args, ctx) => result(() => agents.run(args, ctx.mcpReq.signal)));
@@ -78,7 +79,7 @@ function createServer() {
       text: limit(6_000),
       mode: z.enum(["auto", "steer", "followup"]).default("auto"),
       wait: z.boolean().default(false).describe("Wait for completion after answering or starting a follow-up."),
-      timeout_seconds: z.number().int().min(1).max(600).default(120),
+      wait_seconds: z.number().int().min(0).max(300).default(60).describe("Seconds to wait synchronously when wait is true. Does NOT kill the agent if still running."),
     }),
     annotations: localWrite,
   }, (args, ctx) => result(() => agents.send(args, ctx.mcpReq.signal)));

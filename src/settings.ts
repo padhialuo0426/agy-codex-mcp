@@ -20,7 +20,7 @@ const SettingsSchema = z.strictObject({
   persist_threads: z.boolean().default(false),
   allowed_models: z.array(z.string()).default([]),
   max_parallel: z.number().int().min(1).max(8).default(4),
-  max_turn_seconds: z.number().int().min(10).max(3600).default(600),
+  max_turn_seconds: z.number().int().min(10).max(14_400).default(600),
   question_timeout_seconds: z.number().int().min(10).max(1800).default(180),
   max_depth: z.number().int().min(1).max(3).default(1),
   codex_config: z.array(z.string()).default([]),

@@ -28,6 +28,7 @@ export type Agent = {
   network?: boolean;
   ephemeral?: boolean;
   keep_session?: boolean;
+  max_turn_seconds?: number;
   parent?: string;
   depth: number;
   model?: string;
