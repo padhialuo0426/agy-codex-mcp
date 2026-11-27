@@ -57,6 +57,10 @@ function evaluate(
   }
 
   const fresh = events.filter((ev) => ev.seq > afterSeq);
+  const unreadReports = fresh
+    .filter((ev) => ev.kind === "report")
+    .map((ev) => ev.text)
+    .filter((text): text is string => Boolean(text));
   const terminals = fresh.filter((ev) => TERMINAL.has(ev.kind));
   if (terminals.length > 0) {
     const terminal = terminals[terminals.length - 1];
@@ -65,9 +69,11 @@ function evaluate(
       agent_id: agentId,
       cursor: terminal.seq,
       status: terminal.status,
+      ...(terminal.session_closed !== undefined ? { session_closed: terminal.session_closed } : {}),
       result: terminal.result,
       worktree_path: terminal.worktree_path,
       changes: terminal.changes,
+      ...(unreadReports.length ? { reports: unreadReports } : {}),
       activity: latestActivity,
     };
   }
@@ -75,36 +81,38 @@ function evaluate(
   const questions = fresh.filter((ev) => ev.kind === "question");
   if (questions.length > 0) {
     const latestQuestion = questions[questions.length - 1];
-    const answered = fresh.some(
-      (ev) => ev.kind === "answered" && (ev.seq > latestQuestion.seq || (latestQuestion.question_id && ev.question_id === latestQuestion.question_id)),
+    const resolved = fresh.some(
+      (ev) =>
+        (ev.kind === "answered" || ev.kind === "question_expired") &&
+        (ev.seq > latestQuestion.seq || (latestQuestion.question_id && ev.question_id === latestQuestion.question_id)),
     );
-    if (!answered) {
+    if (!resolved) {
       return {
         wakeup_reason: "needs_input",
+        requires_parent_answer: true,
         agent_id: agentId,
         cursor: latestQuestion.seq,
         status: "needs_input",
         question: { id: latestQuestion.question_id, text: latestQuestion.text },
+        ...(unreadReports.length ? { reports: unreadReports } : {}),
         activity: latestActivity,
         next_watch_command: buildWatchCommand(stateDir, agentId, latestQuestion.seq),
       };
     }
   }
 
-  if (includeReport) {
+  if (includeReport && unreadReports.length > 0) {
     const reports = fresh.filter((ev) => ev.kind === "report");
-    if (reports.length > 0) {
-      const lastReport = reports[reports.length - 1];
-      return {
-        wakeup_reason: "report",
-        agent_id: agentId,
-        cursor: lastReport.seq,
-        status: latestStatus,
-        report: reports.map((r) => r.text).filter(Boolean).join("\n\n"),
-        activity: latestActivity,
-        next_watch_command: buildWatchCommand(stateDir, agentId, lastReport.seq),
-      };
-    }
+    const lastReport = reports[reports.length - 1];
+    return {
+      wakeup_reason: "report",
+      agent_id: agentId,
+      cursor: lastReport.seq,
+      status: latestStatus,
+      report: unreadReports.join("\n\n"),
+      activity: latestActivity,
+      next_watch_command: buildWatchCommand(stateDir, agentId, lastReport.seq),
+    };
   }
 
   return undefined;

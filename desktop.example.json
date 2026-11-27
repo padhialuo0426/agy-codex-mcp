@@ -10,5 +10,5 @@
   "max_parallel": 4,
   "max_depth": 1,
   "max_turn_seconds": 600,
-  "question_timeout_seconds": 300
+  "question_timeout_seconds": 900
 }

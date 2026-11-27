@@ -50,13 +50,13 @@ function makeProgress(
 }
 
 function createServer() {
-  const server = new McpServer({ name: "agy-codex-mcp", version: "0.3.0" }, {
-    instructions: "Delegate coding tasks to local Codex without manual approvals or polling loops. Call codex_run (waits up to wait_seconds; returns result and diff when done, or still_running: true with watch_command if a long script is still active — never poll in a loop; run watch_command via a background shell task for zero-token reactive wakeup). Use codex_send to steer a running turn in real time (mode: 'steer'), answer ask_parent questions (no reply_to ID needed), or follow up. Use codex_manage for status (live activity & events), list, changes, interrupt, close, and cleanup. Discover models with codex_models when requested.",
+  const server = new McpServer({ name: "agy-codex-mcp", version: "0.4.0" }, {
+    instructions: "Delegate coding tasks to local Codex without manual approvals or polling loops. Call codex_run (use wait_seconds: 0 for background proxies or default wait_seconds: 90 for short synchronous tasks; if still active, returns still_running: true with watch_command and recommended_notification_timeout_seconds — NEVER poll in a loop; run watch_command via a background shell task for zero-token reactive wakeup). Use input_patch_file (absolute path) for patch files; input_patch accepts raw Git diff strings only. Worktree results automatically save full untruncated patches to changes.patch_file (or custom output_patch_path via codex_manage(action: 'changes')). Use codex_send to answer ask_parent questions (mode: 'answer' or 'auto'), steer live turns (mode: 'steer' or 'auto'), or follow up. Use codex_manage for status, list, changes, interrupt, close, and cleanup. Discover models with codex_models when requested.",
   });
 
   server.registerTool("codex_run", {
     title: "Run Codex subagent",
-    description: "Start a new Codex agent (supply workspace) or continue an existing one (supply agent_id). Waits up to wait_seconds before returning still_running: true with a zero-polling watch_command. Ephemeral sessions auto-close after delivery unless keep_session: true is set.",
+    description: "Start a new Codex agent (supply workspace) or continue an existing one (supply agent_id). Waits up to wait_seconds before returning still_running: true with a zero-polling watch_command (pass wait_seconds: 0 for immediate background return). Ephemeral sessions auto-close after delivery unless keep_session: true is set.",
     inputSchema: z.strictObject({
       agent_id: agent.optional().describe("Existing agent ID to continue instead of spawning a new one."),
       workspace: limit(4_096).optional().describe("Absolute project or work-copy directory. Required when agent_id is omitted."),
@@ -68,23 +68,25 @@ function createServer() {
       model: limit(100).optional().describe("Model ID from codex_models. Omit for Codex default."),
       effort: limit(100).optional().describe("Reasoning effort value from codex_models."),
       base: limit(200).optional().describe("Git revision for worktree mode, defaults to HEAD."),
-      input_patch: z.string().min(1).max(120_000).optional().describe("Explicit Git patch to apply when creating a worktree."),
+      input_patch: z.string().min(1).max(120_000).optional().describe("Raw Git diff string (NOT a file path; use input_patch_file for patch files)."),
+      input_patch_file: limit(4_096).optional().describe("Absolute path to a local Git patch file to apply when creating a worktree (no 120KB inline limit)."),
       fork_from: agent.optional().describe("Fork context from a settled agent in the same workspace (requires keep_session: true on the source agent)."),
-      background: z.boolean().default(false).describe("Return immediately with agent_id and watch_command."),
+      background: z.boolean().default(false).describe("Return immediately with agent_id and watch_command (equivalent to wait_seconds: 0)."),
       keep_session: z.boolean().optional().describe("Keep the Codex thread alive after delivery for multi-turn follow-ups. Defaults to false for new runs."),
       wait_seconds: z.number().int().min(0).max(300).default(90).describe("Seconds to wait synchronously before returning still_running: true and watch_command (0 = immediate return). Does NOT kill running scripts."),
       max_turn_seconds: z.number().int().min(1).max(14_400).optional().describe("Hard execution deadline in seconds for this turn. When exceeded, the turn is interrupted and child scripts are terminated."),
+      question_timeout_seconds: z.number().int().min(1).max(3_600).optional().describe("Seconds to wait for an ask_parent answer before expiring (defaults to server setting, 900s)."),
     }),
     annotations: write,
   }, (args, ctx) => result(() => agents.run(args, ctx.mcpReq.signal, makeProgress(ctx, args.wait_seconds))));
 
   server.registerTool("codex_send", {
     title: "Message or answer Codex subagent",
-    description: "Send input to a Codex agent. In auto mode (default), answers any pending question directly, steers a running turn in real time, or starts a follow-up on a settled agent.",
+    description: "Send input to a Codex agent. Use mode='answer' to explicitly answer a pending ask_parent question, mode='steer' to inject mid-turn instructions, mode='followup' on a settled agent, or mode='auto' (default: answers if a question is pending, else steers if running, else starts follow-up).",
     inputSchema: z.strictObject({
       agent_id: agent,
       text: limit(6_000),
-      mode: z.enum(["auto", "steer", "followup"]).default("auto"),
+      mode: z.enum(["auto", "answer", "steer", "followup"]).default("auto"),
       wait: z.boolean().default(false).describe("Wait for completion after answering or starting a follow-up."),
       wait_seconds: z.number().int().min(0).max(300).default(90).describe("Seconds to wait synchronously when wait is true."),
     }),
@@ -93,11 +95,12 @@ function createServer() {
 
   server.registerTool("codex_manage", {
     title: "Manage Codex subagents",
-    description: "Inspect live status/activity and recent events (status), list recent agents (list), read worktree diff (changes), interrupt a turn (interrupt), close an agent (close), or purge old persisted threads/worktrees (cleanup).",
+    description: "Inspect live status/activity and recent events (status), list recent agents (list), read worktree diff/patch_file (changes), interrupt a turn (interrupt), close an agent (close), or purge old persisted threads/worktrees/patches (cleanup).",
     inputSchema: z.strictObject({
       action: z.enum(["status", "list", "changes", "interrupt", "close", "cleanup"]),
       agent_id: agent.optional(),
       path: limit(2_000).optional().describe("Optional relative path filter for action='changes'."),
+      output_patch_path: limit(4_096).optional().describe("Optional absolute file path to write the full untruncated Git patch for action='changes'."),
       limit: z.number().int().min(1).max(50).default(20).optional().describe("Max agents for action='list'."),
     }),
     annotations: localWrite,

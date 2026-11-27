@@ -4,9 +4,9 @@
 
 ## 核心工具（仅 4 个）
 
-1. **`codex_run`**：派工并同步等待最多 `wait_seconds`（默认 90 秒；支持 `mode: "read_only" | "worktree" | "workspace"`）。若长脚本仍在正常执行，返回 `still_running: true`、实时 `activity` 与 `watch_command`（不会误杀脚本）；交付后默认自动关闭临时会话与空工作树（多轮续聊可传 `keep_session: true`）。
-2. **`codex_send`**：实时双向沟通——在后台等待期间可随时 `mode: "steer"` 向运行中的 Codex 插入补充指令，也可直接回答 `ask_parent` 阻塞提问（无需 `reply_to` ID），或对保留会话发起续派。
-3. **`codex_manage`**：统一管理接口（`action: "status" | "list" | "changes" | "interrupt" | "close" | "cleanup"`）。其中 `status` 查看当前命令/文件改动活动、耗时与最新事件；`cleanup` 批量删除历史持久化会话、移除残留工作树与事件流文件。
+1. **`codex_run`**：派工并同步等待最多 `wait_seconds`（默认 90 秒；`0` 表示立即后台返回；支持 `mode: "read_only" | "worktree" | "workspace"`）。支持 `input_patch_file` 直接读取本地 `.patch` 文件，以及 `question_timeout_seconds` 按任务调整提问超时（默认 900 秒）。若长脚本仍在正常执行，返回 `still_running: true`、实时 `activity`、`watch_command` 与 `recommended_notification_timeout_seconds`（不会误杀脚本）；交付后默认自动关闭临时会话与空工作树（多轮续聊可传 `keep_session: true`）。
+2. **`codex_send`**：实时双向沟通——支持显式 `mode: "answer"` 回答 `ask_parent` 阻塞提问、`mode: "steer"` 向运行中的 Codex 插入补充指令、`mode: "followup"` 续派，或用默认 `mode: "auto"` 自动分派。
+3. **`codex_manage`**：统一管理接口（`action: "status" | "list" | "changes" | "interrupt" | "close" | "cleanup"`）。`status` 查看当前活动与耗时（重复轮询会给出纠偏警告）；`changes` 自动导出完整未截断补丁到 `patch_file`（支持 `output_patch_path` 指定导出路径）并返回 `diff_stat`；`cleanup` 批量删除历史持久化会话、移除残留工作树与事件流/补丁文件。
 4. **`codex_models`**：查询当前 Codex 账号可用的模型 ID 与推理档位。
 
 ## 零轮询后台唤醒与双向实时沟通
@@ -30,7 +30,7 @@
 
 仓库内置 [skills/codex-subagent/SKILL.md](skills/codex-subagent/SKILL.md)，可复制到 `~/.gemini/config/skills/codex-subagent/SKILL.md`：
 
-- **非阻塞后台代理**：用 `define_subagent(EnableMCPTools: true, EnableWriteTools: true)` + `invoke_subagent(Model: "flash_lite")` 托管长任务——遇到 `still_running: true` 时在后台运行 `watch_command` 休眠等待系统唤醒，全程零轮询。
+- **非阻塞后台代理**：用 `define_subagent(EnableMCPTools: true, EnableWriteTools: true)` + `invoke_subagent(Model: "flash")` 托管长任务——以 `wait_seconds: 0` 派工并在后台运行 `watch_command`（`NotificationTimeoutSeconds: 1800`）休眠等待系统唤醒，全程零轮询。
 - **`/swarm` 接入**：在 `/swarm` 会话中拉起轻量化代理成员（`workspace: "share"`），通过 `codex_run(workspace: <成员工作目录>, mode: "workspace")` 让 Codex 在独立副本中执行并借助 `watch.js` 与 `codex_send(mode: "steer")` 在看板上实时沟通。
 
 ## 安装与验证

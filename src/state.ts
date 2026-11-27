@@ -30,6 +30,7 @@ export type Agent = {
   ephemeral?: boolean;
   keep_session?: boolean;
   max_turn_seconds?: number;
+  question_timeout_seconds?: number;
   turn_started_at?: string;
   activity?: AgentActivity;
   last_changes?: StreamChanges;

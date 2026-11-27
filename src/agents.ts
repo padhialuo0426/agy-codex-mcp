@@ -5,7 +5,7 @@ import { reapAgentProcesses, reapBridgeProcesses } from "./processes.js";
 import { State, busy, ownerAlive, ownerId, type Agent, type AgentMode, type Role } from "./state.js";
 import { ToolError, workspace, type Settings } from "./settings.js";
 import { appendStream, buildWatchCommand, removeStream, type AgentActivity, type StreamChanges, type StreamEvent } from "./streams.js";
-import { makeWorktree, planWorktree, readChanges, removeWorktree } from "./worktrees.js";
+import { makeWorktree, planWorktree, readChanges, removePatch, removeWorktree, resolveInputPatch } from "./worktrees.js";
 
 const roles: Record<Role, string> = {
   default: "Carry out the delegated task and report the result with evidence.",
@@ -34,16 +34,18 @@ type RunArgs = {
   effort?: string;
   base?: string;
   input_patch?: string;
+  input_patch_file?: string;
   fork_from?: string;
   background: boolean;
   keep_session?: boolean;
   wait_seconds: number;
   max_turn_seconds?: number;
+  question_timeout_seconds?: number;
 };
 type SendArgs = {
   agent_id: string;
   text: string;
-  mode: "auto" | "steer" | "followup";
+  mode: "auto" | "answer" | "steer" | "followup";
   wait: boolean;
   wait_seconds: number;
 };
@@ -51,6 +53,7 @@ type ManageArgs = {
   action: "status" | "list" | "changes" | "interrupt" | "close" | "cleanup";
   agent_id?: string;
   path?: string;
+  output_patch_path?: string;
   limit?: number;
 };
 export type ProgressCallback = (elapsedSec: number, activity?: AgentActivity) => void;
@@ -71,6 +74,7 @@ export class Agents {
   private readonly lastSeq = new Map<string, number>();
   private readonly deadlines = new Map<string, NodeJS.Timeout>();
   private readonly changing = new Set<string>();
+  private readonly statusPolls = new Map<string, { lastAt: number; lastSeq: number; count: number }>();
   private stopping = false;
 
   constructor(private readonly settings: Settings) {
@@ -95,14 +99,23 @@ export class Agents {
     if (this.stopping) throw new ToolError("server_stopping", "The MCP server is shutting down.");
     const startCursor = this.state.latestSeq();
     const agent = args.agent_id
-      ? await this.continueAgent(args.agent_id, args.task, args.context, args.keep_session, args.max_turn_seconds)
+      ? await this.continueAgent(
+        args.agent_id,
+        args.task,
+        args.context,
+        args.keep_session,
+        args.max_turn_seconds,
+        args.question_timeout_seconds,
+      )
       : await this.spawnNew(args);
     if (args.background || args.wait_seconds === 0) {
-      const cursor = this.currentSeq(agent.agent_id, startCursor);
+      const latest = this.state.require(agent.agent_id);
+      const cursor = startCursor;
       return {
         ...agent,
         cursor,
         watch_command: buildWatchCommand(this.settings.state_dir, agent.agent_id, cursor),
+        recommended_notification_timeout_seconds: this.recommendedWatchTimeout(latest),
       };
     }
     return this.waitUntilSettled(agent.agent_id, args.wait_seconds, startCursor, signal, onProgress);
@@ -112,13 +125,19 @@ export class Agents {
     const startCursor = this.currentSeq(args.agent_id, 0);
     const outcome = await this.exclusive(args.agent_id, async () => {
       const agent = this.state.require(args.agent_id);
-      if (args.mode === "auto" && agent.question) {
+      if (args.mode === "answer" || (args.mode === "auto" && agent.question)) {
+        if (!agent.question) {
+          throw new ToolError("question_not_pending", "This agent has no pending ask_parent question to answer.");
+        }
         const ownedAgent = this.owned(agent.id);
         const pending = this.questions.get(ownedAgent.id);
-        if (!pending) throw new ToolError("question_not_pending", "This question is no longer pending.");
+        if (!pending) {
+          throw new ToolError("question_not_pending", "This agent has no pending ask_parent question to answer.");
+        }
+        const answered_question = agent.question.text;
         this.answer(ownedAgent, args.text, true);
         this.emitEvent(ownedAgent, "answered", output(args.text, 1_000), { questionId: pending.id });
-        return { delivery: "answer" as const, waitable: true, view: this.view(this.state.require(ownedAgent.id)) };
+        return { delivery: "answer" as const, answered_question, waitable: true, view: this.view(this.state.require(ownedAgent.id)) };
       }
       if (args.mode === "steer" || (args.mode === "auto" && agent.status === "running" && agent.turn)) {
         const ownedAgent = this.owned(agent.id);
@@ -129,8 +148,14 @@ export class Agents {
           this.emitEvent(ownedAgent, "steered", output(args.text, 1_000));
           return { delivery: "steer" as const, waitable: false, view: this.view(this.state.require(ownedAgent.id)) };
         }
+        const pending_question = ownedAgent.question?.text;
         this.enqueue(ownedAgent, args.text);
-        return { delivery: "queued" as const, waitable: false, view: this.view(this.state.require(ownedAgent.id)) };
+        return {
+          delivery: "queued" as const,
+          ...(pending_question ? { pending_question } : {}),
+          waitable: false,
+          view: this.view(this.state.require(ownedAgent.id)),
+        };
       }
       if (busy(agent)) {
         throw new ToolError("agent_busy", "This agent is currently running. Use mode='steer' or wait for it to settle.");
@@ -147,8 +172,14 @@ export class Agents {
     const cursor = this.currentSeq(args.agent_id, startCursor);
     return {
       delivery: outcome.delivery,
+      ...("answered_question" in outcome && outcome.answered_question ? { answered_question: outcome.answered_question } : {}),
+      ...("pending_question" in outcome && outcome.pending_question ? { pending_question: outcome.pending_question } : {}),
       ...this.view(latest),
-      ...(busy(latest) ? { cursor, watch_command: buildWatchCommand(this.settings.state_dir, args.agent_id, cursor) } : {}),
+      ...(busy(latest) ? {
+        cursor,
+        watch_command: buildWatchCommand(this.settings.state_dir, args.agent_id, cursor),
+        recommended_notification_timeout_seconds: this.recommendedWatchTimeout(latest),
+      } : {}),
     };
   }
 
@@ -185,15 +216,36 @@ export class Agents {
       const recent_events = this.state.recentForAgents([agentId], 0, 15);
       const view = this.view(agent);
       const cursor = this.currentSeq(agentId, recent_events.at(-1)?.seq ?? 0);
+      let polling_warning: string | undefined;
+      if (busy(agent)) {
+        const now = Date.now();
+        const prev = this.statusPolls.get(agentId);
+        const count = prev && now - prev.lastAt <= 60_000 && prev.lastSeq === cursor ? prev.count + 1 : 1;
+        this.statusPolls.set(agentId, { lastAt: now, lastSeq: cursor, count });
+        if (count >= 2) {
+          polling_warning = "Repeated status polling detected with no new events. Stop polling codex_manage(status); run watch_command in a background shell task and end your turn for zero-token wakeup.";
+        }
+      } else {
+        this.statusPolls.delete(agentId);
+      }
       return {
         ...view,
         recent_events,
         ...(agent.last_changes ? { changes: agent.last_changes } : {}),
-        ...(busy(agent) ? { cursor, watch_command: buildWatchCommand(this.settings.state_dir, agentId, cursor) } : {}),
+        ...(polling_warning ? { polling_warning } : {}),
+        ...(busy(agent) ? {
+          cursor,
+          watch_command: buildWatchCommand(this.settings.state_dir, agentId, cursor),
+          recommended_notification_timeout_seconds: this.recommendedWatchTimeout(agent),
+        } : {}),
       };
     }
     if (args.action === "changes") {
-      return readChanges(this.settings, this.state.require(agentId), args.path);
+      return readChanges(this.settings, this.state.require(agentId), {
+        path: args.path,
+        exportPatch: true,
+        outputPatchPath: args.output_patch_path,
+      });
     }
     if (args.action === "interrupt") {
       return this.exclusive(agentId, async () => {
@@ -228,6 +280,10 @@ export class Agents {
     return this.lastSeq.get(agentId) ?? fallback;
   }
 
+  private recommendedWatchTimeout(agent: Agent): number {
+    return Math.min(3_600, Math.max(1_800, agent.max_turn_seconds ?? this.settings.max_turn_seconds));
+  }
+
   private emitEvent(
     agent: Agent,
     kind: StreamEvent["kind"],
@@ -239,6 +295,8 @@ export class Agents {
       worktree_path?: string;
       changes?: StreamChanges;
       owner_pid?: number;
+      statusOverride?: string;
+      session_closed?: boolean;
     },
   ): number {
     const seq = this.state.event(agent, extra?.sqlKind ?? kind, text, extra?.questionId);
@@ -247,7 +305,8 @@ export class Agents {
       seq,
       at: new Date().toISOString(),
       kind,
-      status: agent.status,
+      status: extra?.statusOverride ?? agent.status,
+      ...(extra?.session_closed !== undefined ? { session_closed: extra.session_closed } : {}),
       ...(extra?.owner_pid !== undefined ? { owner_pid: extra.owner_pid } : {}),
       text,
       ...(extra?.questionId ? { question_id: extra.questionId } : {}),
@@ -261,16 +320,17 @@ export class Agents {
 
   private async spawnNew(args: {
     workspace?: string; task: string; context?: string; mode: AgentMode; role: Role;
-    network?: boolean; model?: string; effort?: string; base?: string; input_patch?: string;
-    fork_from?: string; keep_session?: boolean; max_turn_seconds?: number;
+    network?: boolean; model?: string; effort?: string; base?: string; input_patch?: string; input_patch_file?: string;
+    fork_from?: string; keep_session?: boolean; max_turn_seconds?: number; question_timeout_seconds?: number;
   }, parent?: Agent) {
     if (!args.workspace) {
       throw new ToolError("workspace_required", "Provide workspace when starting a new agent, or pass agent_id to continue an existing one.");
     }
     const cwd = workspace(this.settings, args.workspace);
-    if ((args.base || args.input_patch) && args.mode !== "worktree") {
+    if ((args.base || args.input_patch || args.input_patch_file) && args.mode !== "worktree") {
       throw new ToolError("worktree_required", "A base commit or input patch requires worktree mode.");
     }
+    const resolvedPatch = resolveInputPatch(args.input_patch, args.input_patch_file);
     const plan = args.mode === "worktree" ? await planWorktree(this.settings, cwd, args.base) : undefined;
     const selectedModel = await this.selectModel(cwd, args.model, args.effort);
     const id = randomUUID();
@@ -281,6 +341,7 @@ export class Agents {
       parent: parent?.id, depth: parent ? parent.depth + 1 : 1, model: selectedModel, effort: args.effort,
       network: args.network, ephemeral, keep_session: args.keep_session ?? false,
       max_turn_seconds: args.max_turn_seconds,
+      question_timeout_seconds: args.question_timeout_seconds,
     };
     let source: Agent | undefined;
     this.state.change(() => {
@@ -297,7 +358,7 @@ export class Agents {
     });
     return this.launch(agent, async (current) => {
       if (plan) {
-        const tree = await makeWorktree(this.settings, current, plan, args.input_patch);
+        const tree = await makeWorktree(this.settings, current, plan, resolvedPatch);
         if (!this.activeTurn(current)) return;
         Object.assign(current, tree);
         this.state.save(current);
@@ -317,17 +378,25 @@ export class Agents {
     });
   }
 
-  private async continueAgent(agentId: string, task: string, context?: string, keepSession?: boolean, maxTurnSeconds?: number) {
+  private async continueAgent(
+    agentId: string,
+    task: string,
+    context?: string,
+    keepSession?: boolean,
+    maxTurnSeconds?: number,
+    questionTimeoutSeconds?: number,
+  ) {
     return this.exclusive(agentId, async () => {
       const current = this.state.require(agentId);
       if (busy(current)) {
         throw new ToolError("agent_busy", "This agent is currently busy. Use codex_send or codex_manage instead.");
       }
       await this.resumeIfNeeded(agentId);
-      if (keepSession !== undefined || maxTurnSeconds !== undefined) {
+      if (keepSession !== undefined || maxTurnSeconds !== undefined || questionTimeoutSeconds !== undefined) {
         const latest = this.state.require(agentId);
         if (keepSession !== undefined) latest.keep_session = keepSession;
         if (maxTurnSeconds !== undefined) latest.max_turn_seconds = maxTurnSeconds;
+        if (questionTimeoutSeconds !== undefined) latest.question_timeout_seconds = questionTimeoutSeconds;
         this.state.save(latest);
       }
       return this.startFollowupUnlocked(agentId, task, context);
@@ -415,6 +484,7 @@ export class Agents {
           still_running: true,
           cursor,
           watch_command: buildWatchCommand(this.settings.state_dir, agentId, cursor),
+          recommended_notification_timeout_seconds: this.recommendedWatchTimeout(current),
         };
       }
       if (done || needsInput) {
@@ -432,7 +502,12 @@ export class Agents {
           ...this.view(finalAgent),
           ...(finalAgent.last_changes ? { changes: finalAgent.last_changes } : {}),
           ...(reports.length ? { reports } : {}),
-          ...(needsInput ? { cursor, watch_command: buildWatchCommand(this.settings.state_dir, agentId, cursor) } : {}),
+          ...(needsInput ? {
+            requires_parent_answer: true,
+            cursor,
+            watch_command: buildWatchCommand(this.settings.state_dir, agentId, cursor),
+            recommended_notification_timeout_seconds: this.recommendedWatchTimeout(finalAgent),
+          } : {}),
         };
       }
       if (onProgress && Date.now() - lastProgressAt >= 15_000) {
@@ -461,19 +536,23 @@ export class Agents {
       let changes: StreamChanges | undefined;
       if (settledAgent.worktree) {
         try {
-          changes = await readChanges(this.settings, settledAgent);
+          changes = await readChanges(this.settings, settledAgent, { exportPatch: true });
           settledAgent.last_changes = changes;
           this.state.save(settledAgent);
         } catch { /* Ignore diff read failure on settled summary. */ }
       }
-      if (!settledAgent.keep_session) {
+      const autoClosed = !settledAgent.keep_session;
+      if (autoClosed) {
         await this.releaseAfterDelivery(settledAgent, changes);
       }
+      this.statusPolls.delete(agentId);
       const finalAgent = this.state.require(agentId);
       this.emitEvent(finalAgent, status, finalAgent.last ?? description, {
         result: finalAgent.last ?? description,
         worktree_path: finalAgent.worktree?.path,
         changes: finalAgent.last_changes ?? changes,
+        statusOverride: status,
+        session_closed: autoClosed,
       });
     })().finally(() => {
       this.settling.delete(agentId);
@@ -577,7 +656,9 @@ export class Agents {
       this.clearDeadline(agent.id);
       this.lastSeq.delete(agent.id);
       this.lastReaped.delete(agent.id);
+      this.statusPolls.delete(agent.id);
       removeStream(this.settings.state_dir, agent.id);
+      removePatch(this.settings.state_dir, agent.id);
       this.state.deleteAgent(agent.id);
       pruned_agents++;
     }
@@ -604,6 +685,7 @@ export class Agents {
         this.byThread.delete(current.thread);
       }
       this.clearDeadline(id);
+      this.statusPolls.delete(id);
       current.status = "closed";
       current.settled = current.generation;
       current.owner = undefined;
@@ -947,12 +1029,13 @@ export class Agents {
     } else if (tool === "ask_parent") {
       if (this.questions.has(agent.id)) { reply("One question is already waiting for a reply.", false); return; }
       const questionId = randomUUID();
+      const timeoutSec = agent.question_timeout_seconds ?? this.settings.question_timeout_seconds;
       const timer = setTimeout(() => {
         const current = this.state.find(agent.id);
         if (!current || this.questions.get(agent.id)?.id !== questionId) return;
         this.answer(current, "The parent did not answer before the clarification deadline. Report the blocker or continue only where assumptions are safe.", false);
-        this.state.event(current, "question_expired", "The clarification deadline elapsed.", questionId);
-      }, this.settings.question_timeout_seconds * 1_000);
+        this.emitEvent(current, "question_expired", "The clarification deadline elapsed.", { questionId });
+      }, timeoutSec * 1_000);
       this.questions.set(agent.id, { id: questionId, rpc: id, timer });
       agent.status = "needs_input";
       agent.question = { id: questionId, text };

@@ -14,6 +14,8 @@ export type StreamChanges = {
   untracked: string;
   diff: string;
   diff_truncated: boolean;
+  diff_stat?: string;
+  patch_file?: string;
   base?: string;
   worktree_path?: string;
 };
@@ -21,8 +23,9 @@ export type StreamChanges = {
 export type StreamEvent = {
   seq: number;
   at: string;
-  kind: "started" | "activity" | "report" | "question" | "answered" | "steered" | "completed" | "failed" | "interrupted" | "closed";
+  kind: "started" | "activity" | "report" | "question" | "answered" | "question_expired" | "steered" | "completed" | "failed" | "interrupted" | "closed";
   status: string;
+  session_closed?: boolean;
   owner_pid?: number;
   text?: string;
   question_id?: string;
